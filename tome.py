@@ -196,6 +196,11 @@ def load_config(root: Path) -> Config:
 def configure(cfg: Config) -> None:
     """Publish the resolved config to the module globals the rest of it reads."""
     global ROOT, CFG, KIND_ORDER
+    # ROOT must be fully resolved, because `safe_path` compares it against
+    # resolved paths. Windows 8.3 short names (`RUNNER~1`) and macOS's
+    # /tmp → /private/tmp symlink both make an unresolved root fail that
+    # comparison for every file in the repo.
+    cfg.root = cfg.root.resolve()
     ROOT = cfg.root
     CFG = cfg
     KIND_ORDER = {kind: i for i, kind in enumerate(cfg.pinned)}

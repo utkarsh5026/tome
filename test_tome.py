@@ -71,6 +71,12 @@ class TestConfig(unittest.TestCase):
         root = make_repo({"README.md": "# hi", ".tome.json": "{ not json"})
         self.assertEqual(tome.CFG.name, root.name)
 
+    def test_root_is_always_resolved(self):
+        """Windows 8.3 names and macOS's /tmp symlink break every path compare."""
+        root = make_repo({"README.md": "# hi"})
+        self.assertEqual(tome.ROOT, root.resolve())
+        self.assertEqual(tome.ROOT, tome.ROOT.resolve())
+
     def test_custom_editor_template_passes_through(self):
         cfg = tome.Config(root=Path("/tmp"), editor="mine://x?f={path}")
         self.assertEqual(cfg.editor_url, "mine://x?f={path}")
