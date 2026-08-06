@@ -69,13 +69,23 @@ Pick whichever matches how you already install tools.
 
 ```bash
 # uv — recommended, installs the `tome` command globally
-uv tool install git+https://github.com/utkarsh5026/tome
+uv tool install tome-docs
 
 # pipx
-pipx install git+https://github.com/utkarsh5026/tome
+pipx install tome-docs
 
-# no install at all — run it straight from GitHub
-uvx --from git+https://github.com/utkarsh5026/tome tome
+# plain pip
+pip install tome-docs
+
+# no install at all — run it straight from PyPI
+uvx --from tome-docs tome
+```
+
+Want the tip of `main` instead of the latest release? Point any of the above
+at the repo:
+
+```bash
+uv tool install git+https://github.com/utkarsh5026/tome
 ```
 
 Or, because it really is one file with no imports beyond the standard library:
@@ -86,6 +96,25 @@ chmod +x ~/.local/bin/tome
 ```
 
 Needs Python 3.9+. That's the entire dependency list.
+
+### Update
+
+Whichever way you installed it, updating uses the same tool — tome doesn't
+phone home or update itself:
+
+```bash
+uv tool upgrade tome-docs      # uv
+pipx upgrade tome-docs         # pipx
+pip install -U tome-docs       # plain pip
+
+# installed from the tip of main
+uv tool install --force git+https://github.com/utkarsh5026/tome
+
+# installed via curl
+curl -o ~/.local/bin/tome https://raw.githubusercontent.com/utkarsh5026/tome/main/tome.py
+```
+
+`tome --version` prints what you currently have.
 
 ---
 

@@ -107,6 +107,33 @@ leading H1 and tagline because the hero restates them (it warns if the README
 stops opening that way), and it rewrites `/raw?p=` image URLs and `#/` doc links,
 which only exist inside the running app, into plain relative and GitHub paths.
 
+## Releasing to PyPI
+
+The package is published as `tome-docs` (the `tome` name on PyPI was already
+taken). `.github/workflows/publish.yml` builds and publishes on any tag matching
+`v*.*.*`, using PyPI trusted publishing (OIDC) — there is no API token in this
+repo's secrets, and there should never be one.
+
+To cut a release: bump `__version__` in `tome.py` (the single source hatchling
+reads via `[tool.hatch.version]`), commit, then tag and push:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The workflow refuses to publish if the tag doesn't match `__version__`, so a
+forgotten version bump fails CI instead of shipping the wrong version.
+
+One-time setup on PyPI's side, required before the first tag is pushed: since
+`tome-docs` doesn't exist as a PyPI project yet, register a **pending
+publisher** at <https://pypi.org/manage/account/publishing/> — project name
+`tome-docs`, repo `utkarsh5026/tome`, workflow `publish.yml`, environment
+`pypi`. PyPI creates the project automatically on the first successful publish
+from that pending publisher. Until this is registered, the workflow's `publish`
+job will fail with an authentication error — the `build` job works regardless,
+since it doesn't touch PyPI.
+
 ## Regenerating the screenshots
 
 `assets/*.png` are real captures, not mockups. Headless Chrome can't press keys,
