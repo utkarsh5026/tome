@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # No install step on purpose: if this ever needs one, the promise in the
+      # README ("zero dependencies") has been broken.
+      - run: python -m unittest -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Lint only — see the note in pyproject.toml about hand formatting.
+      - run: pipx run ruff check .
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # The install path the README tells people to use has to actually work.
+      - run: uv tool install .
+      - run: tome --version
+      - name: serve this repo and check it responds
+        run: |
+          tome --port 7979 &
+          sleep 3
+          curl -sf http://127.0.0.1:7979/ | grep -q "<title>"
+          curl -sf http://127.0.0.1:7979/api/tree | grep -q '"groups"'

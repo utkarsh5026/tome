@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tome-docs"
+dynamic = ["version"]
+description = "Read any repo's markdown in a browser tab. One file, no dependencies, no network."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Utkarsh Priyadarshi", email = "utkarshpriyadarshi5026@gmail.com" }]
+keywords = ["markdown", "docs", "documentation", "reader", "viewer", "monorepo", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Documentation",
+  "Topic :: Software Development :: Documentation",
+  "Topic :: Text Processing :: Markup :: Markdown",
+]
+# Deliberately empty, and meant to stay that way. The whole point is that
+# `tome` runs anywhere Python does, with nothing to install alongside it.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/utkarsh5026/tome"
+Issues = "https://github.com/utkarsh5026/tome/issues"
+
+[project.scripts]
+tome = "tome:cli"
+
+[tool.hatch.version]
+path = "tome.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["tome.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["tome.py", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+# Lint only. This file is hand-formatted on purpose — the language tables and
+# the CSS/JS inside PAGE are laid out to be read, and `ruff format` undoes that.
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E741"]  # `l` reads fine in a tokenizer
