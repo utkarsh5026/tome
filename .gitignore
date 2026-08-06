@@ -9,3 +9,7 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+
+# scratch copies made by tools/shots/inject.py
+tome_shot.py
+*_shot.py

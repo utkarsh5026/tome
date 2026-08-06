@@ -8,6 +8,8 @@ cd ~/work/some-repo
 tome --open
 ```
 
+![The reading view](assets/reading.png)
+
 That's it. `tome` finds the repo root, discovers every `.md` under it, groups them
 the way the repo is actually laid out, and serves a fast reader on `127.0.0.1`.
 Edit a doc in your editor and the page re-renders in place, keeping your scroll
@@ -16,6 +18,30 @@ position.
 It exists because reading docs *inside* the editor is bad — you lose the split you
 were coding in, the rendering is mediocre, and cross-doc links go nowhere. Docs
 belong in the other window.
+
+---
+
+## What it looks like
+
+**⌘K searches every doc at once** — fuzzy title matches first, then full-text hits
+with the matching line and its line number. Enter jumps you to the match, not just
+the page.
+
+![The search palette](assets/search.png)
+
+**Links into code actually open the code.** A doc that says
+`[error.rs](../src/error.rs)` gets you the real file, syntax-highlighted, in the
+same reader — no editor round-trip to check whether the doc still matches reality.
+
+![A source file opened from a doc link](assets/source.png)
+
+**Nineteen themes, hover to preview.** Each swatch is rendered in its own palette,
+so what you hover is what you get. The choice follows you into every other repo you
+open.
+
+![The theme picker](assets/themes.png)
+
+<sub>Screenshots are of <a href="https://github.com/utkarsh5026/backend-gauntlet">backend-gauntlet</a>, a 22-package monorepo — the sidebar grouping and status dots come from its layout, not from configuration.</sub>
 
 ---
 
