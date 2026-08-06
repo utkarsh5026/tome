@@ -80,6 +80,33 @@ in columns, and the formatter destroys that. CI lints only, deliberately.
 - Errors that reach a user are plain sentences on stderr with a next action
   (`hint:` / `warning:`), never tracebacks.
 
+## The website
+
+<https://utkarsh5026.github.io/tome/> is **README.md rendered by tome itself** —
+`site/build.py` imports the module, runs the README through the same `Markdown`
+class the server uses, and lifts the stylesheet straight out of `PAGE`. Two
+consequences worth protecting:
+
+- **There is no second copy of the content.** Edit `README.md` and the site
+  changes. Never add prose to `build.py` that belongs in the README.
+- **The page is a live demo.** If the renderer breaks a table or the highlighter
+  mangles Rust, it breaks in public. That is the point — don't work around a
+  rendering bug in the build script, fix the renderer.
+
+```bash
+python3 site/build.py --serve   # build + preview on :8000
+```
+
+The `site` CI job builds it on every push and PR; the `deploy` job publishes to
+Pages, but only from `main` and only after `test`, `lint`, `install`, and `site`
+are all green. Pages is configured with `build_type: workflow` — there is no
+Jekyll and no `gh-pages` branch, and `site/_site/` is generated, never committed.
+
+Two coupling points to keep in mind when editing: `build.py` strips the README's
+leading H1 and tagline because the hero restates them (it warns if the README
+stops opening that way), and it rewrites `/raw?p=` image URLs and `#/` doc links,
+which only exist inside the running app, into plain relative and GitHub paths.
+
 ## Regenerating the screenshots
 
 `assets/*.png` are real captures, not mockups. Headless Chrome can't press keys,

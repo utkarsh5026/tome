@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Only one Pages deploy at a time, and never cancel one mid-flight — a
+# cancelled deploy can leave the site on a half-published version.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -46,3 +53,42 @@ jobs:
           sleep 3
           curl -sf http://127.0.0.1:7979/ | grep -q "<title>"
           curl -sf http://127.0.0.1:7979/api/tree | grep -q '"groups"'
+
+  # The site is README.md rendered by tome itself, so a broken renderer breaks
+  # the build here rather than shipping a broken page.
+  site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python3 site/build.py
+      - run: grep -q "Read any repo" site/_site/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site/_site
+
+  # Publish only from main, and only once everything above is green.
+  deploy:
+    needs: [test, lint, install, site]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site/_site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/_site
+      - id: deploy
+        uses: actions/deploy-pages@v4
