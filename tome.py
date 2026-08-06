@@ -1290,7 +1290,7 @@ def main(argv: list[str]) -> int:
             print(f"{dest} already exists — leaving it alone", file=sys.stderr)
             return 1
         dest.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        print(f"wrote {dest}")
+        print(f"✅ wrote {dest}")
         return 0
 
     configure(load_config(root))
@@ -1309,7 +1309,7 @@ def main(argv: list[str]) -> int:
     if start := _resolve_start(args.target):
         url += f"#/{start}"
 
-    print(f"{CFG.name} docs → {url}")
+    print(f"📖 {CFG.name} docs → {url}")
     print(
         f"  {total} markdown file{'s' * (total != 1)} · live-reloads on save"
         " · ctrl-K to search · ctrl-C to stop",
@@ -1320,7 +1320,7 @@ def main(argv: list[str]) -> int:
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
+        print("\n👋 bye")
         srv.shutdown()
     return 0
 
