@@ -37,6 +37,7 @@ change that. It serves file contents out of someone's working tree.
 | **Discovery** | `build_tree` and friends: walking, grouping, labelling, kind detection |
 | **Syntax highlighting** | `LangSpec`, the keyword tables, `highlight` |
 | **Markdown → HTML** | the `Markdown` class — one instance per rendered doc |
+| **Formats** | `Format`, `FORMATS`, `DOC_SUFFIXES`, the org translator and the notebook renderer |
 | **Documents** | `safe_path`, `_is_secret`, `render_doc`, `search` |
 | **Server** | `Handler`, CLI parsing, `main`, `cli` |
 | **The page** | `page_html`, `FAVICON`, and `PAGE` — the inline HTML. **The CSS and the app JS inside `PAGE` are generated; edit `web/app.css` and `web/app.js`.** |
@@ -79,6 +80,17 @@ in columns, and the formatter destroys that. CI lints only, deliberately.
   unknown: degrade to a paragraph, never mangle the page. `blocks()` must always
   make progress — `_paragraph` is the branch of last resort and always consumes
   at least one line.
+- **Adding a document format** means one `Format` entry in `FORMATS` and nothing
+  else — discovery, sidebar titles, link classing, search, and `render_doc` all
+  read from `DOC_SUFFIXES`. Never hard-code a suffix outside that table; the
+  `.markdown` files that were discovered but rendered as source code for two
+  releases are what that rule is for. A format's `title` callable runs for every
+  doc on every tree build, so it reads a bounded prefix or it caches (see
+  `_ipynb_title`, which has to do the latter).
+- **A new format does not get its own parser.** Org is translated into markdown
+  and fed to `Markdown`; a notebook's cells are handed to it directly. That is
+  what keeps the rule above honest — a second parser is how the first one starts
+  growing toward CommonMark, and it would drift from it besides.
 - **The highlighter is a tokenizer, not a parser.** It will get edge cases wrong;
   that is accepted. Adding a language means adding a `LangSpec` and an alias, not
   special-casing `highlight`.

@@ -271,6 +271,18 @@ article a code{color:inherit}
 .cb.src{max-width:none}
 .cb.src pre{font-size:12.5px;line-height:1.6}
 
+/* Notebook cell output. Quieter than the code that produced it, and hung off
+   the bottom of it so it reads as belonging to that cell rather than standing
+   on its own. Plots get a white plate — matplotlib writes transparent PNGs,
+   which are invisible on every one of the dark themes. */
+.cb.out{background:transparent;border:0;border-left:2px solid var(--line2);
+  border-radius:0;margin:-12px 0 20px 2px}
+.cb.out pre{padding:9px 15px;font-size:12.5px;color:var(--sub)}
+.cb.out.err{border-left-color:var(--red)}
+.cb.out.err pre{color:var(--red)}
+.nb-img{margin:-6px 0 20px}
+.nb-img img{max-width:100%;border-radius:8px;background:#fff}
+
 .c-kw{color:var(--mauve)} .c-str{color:var(--green)} .c-num{color:var(--peach)}
 .c-cmt{color:var(--dim);font-style:italic} .c-ty{color:var(--yellow)}
 .c-fn{color:var(--blue)} .c-attr{color:var(--teal)} .c-life{color:var(--pink)}

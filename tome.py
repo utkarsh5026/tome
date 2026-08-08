@@ -5,11 +5,13 @@ A zero-dependency local web reader for every markdown file in a repository, so
 you can keep the docs open in one browser tab and code in the other window
 instead of juggling editor splits.
 
-  * DISCOVERS  ← every `*.md` under the repo, grouped the way the repo is laid
-                 out (monorepo packages become their own sections).
+  * DISCOVERS  ← every document under the repo — markdown, org-mode, Jupyter
+                 notebooks — grouped the way the repo is laid out (monorepo
+                 packages become their own sections).
   * RENDERS    ← markdown → HTML in-process (no pip deps, no CDN, no network),
                  including GFM tables, task lists, fenced code with syntax
-                 highlighting, and relative links between docs.
+                 highlighting, and relative links between docs. The other
+                 formats reach that same renderer rather than growing a second.
   * FOLLOWS    ← links to source files (`[router.rs](../src/router.rs)`) open
                  the real file, syntax-highlighted, in the same reader.
   * RELOADS    ← polls mtimes; a doc you edit re-renders in place, scroll kept.
@@ -45,6 +47,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 __version__ = "0.1.1"
@@ -63,6 +66,7 @@ DEFAULT_SKIP_DIRS = {
     "__pycache__", ".venv", "venv", "env", ".vite", ".next", ".nuxt", ".svelte-kit",
     ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".gradle", "vendor",
     ".terraform", "site-packages", ".cache", "coverage", ".idea", "Pods",
+    ".ipynb_checkpoints",
 }
 
 # Top-level directories whose *children* are each worth their own sidebar
@@ -85,8 +89,9 @@ ROOT = Path.cwd()
 CFG: Config
 KIND_ORDER: dict[str, int] = {}
 
-# Images are served as bytes; every other non-.md file a doc links to (.rs,
-# .toml, .json, …) is followed and syntax-highlighted in the reader itself.
+# Images are served as bytes; every other file a doc links to that isn't itself
+# a document (.rs, .toml, .json, …) is followed and syntax-highlighted in the
+# reader. What counts as a document is `DOC_SUFFIXES`, down with the formats.
 RAW_SUFFIXES = {".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"}
 MIME = {
     ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
@@ -264,7 +269,8 @@ class Group:
     docs: list[Doc] = field(default_factory=list)
 
 
-def _walk_md() -> list[Path]:
+def _walk_docs() -> list[Path]:
+    """Every document under ROOT, in whatever formats `FORMATS` registers."""
     found: list[Path] = []
     stack = [ROOT]
     while stack:
@@ -277,28 +283,35 @@ def _walk_md() -> list[Path]:
             if e.is_dir():
                 if e.name not in CFG.skip_dirs:
                     stack.append(e)
-            elif e.suffix.lower() in (".md", ".markdown"):
+            elif e.suffix.lower() in DOC_SUFFIXES:
                 found.append(e)
     return found
 
 
+def _find_stem(d: Path, stem: str, suffixes: tuple[str, ...] = ()) -> Path | None:
+    """`d/stem` in whichever format it exists as — markdown first, unless the
+    caller narrows it to a format whose spelling it actually understands."""
+    for suffix in suffixes or DOC_SUFFIXES:
+        p = d / f"{stem}{suffix}"
+        if p.is_file():
+            return p
+    return None
+
+
 def _first_heading(path: Path) -> str:
-    """The doc's own `# Title`, falling back to a prettified filename."""
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            in_fence = False
-            for _ in range(60):
-                line = fh.readline()
-                if not line:
-                    break
-                s = line.strip()
-                if s.startswith("```"):
-                    in_fence = not in_fence
-                    continue
-                if not in_fence and s.startswith("# "):
-                    return _plain(s[2:].strip())
-    except OSError:
-        pass
+    """The doc's own title, falling back to a prettified filename.
+
+    Each format supplies its own reader for this, because it runs for every doc
+    on every tree build: read a bounded prefix, or cache what you had to parse.
+    """
+    fmt = DOC_SUFFIXES.get(path.suffix.lower())
+    if fmt is not None:
+        try:
+            title = fmt.title(path)
+        except OSError:
+            title = ""
+        if title:
+            return title
     return path.stem.replace("-", " ").replace("_", " ")
 
 
@@ -308,6 +321,13 @@ def _plain(text: str) -> str:
     text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"[*_~]{1,3}", "", text)
     return text.strip()
+
+
+def _slugify(text: str) -> str:
+    """A heading's anchor id. Shared so an org `[[*Section]]` link and the
+    heading it points at agree on the spelling."""
+    base = re.sub(r"[^\w\s-]", "", _plain(text).lower()).strip()
+    return re.sub(r"[\s_]+", "-", base) or "section"
 
 
 def _kind_of(path: Path) -> str:
@@ -334,10 +354,12 @@ def _group_state(gdir: Path) -> str:
     """A render-invisible `<!-- status: state: … -->` block drives the sidebar dot.
 
     Entirely optional: a repo that doesn't use the convention just gets no dot.
+    Markdown only — an HTML comment is the one spelling that stays invisible,
+    and this reads the file on every tree build, which a notebook can't afford.
     """
-    for name in ("SPEC.md", "STATUS.md", "README.md"):
-        path = gdir / name
-        if not path.exists():
+    for name in ("SPEC", "STATUS", "README"):
+        path = _find_stem(gdir, name, MARKDOWN.suffixes)
+        if path is None:
             continue
         m = STATUS_RE.search(path.read_text(encoding="utf-8", errors="replace")[:4000])
         if not m:
@@ -359,7 +381,7 @@ def _doc_label(path: Path, kind: str, title: str) -> str:
 
 
 def build_tree() -> list[Group]:
-    """Group every markdown file the way the repo is actually laid out.
+    """Group every document the way the repo is actually laid out.
 
     Three shapes, in order: files at the repo root are one "repo" section; a
     directory listed in `group_dirs` contributes one section *per child* (the
@@ -387,7 +409,7 @@ def build_tree() -> list[Group]:
             groups[gid] = g
         return groups[gid]
 
-    for path in _walk_md():
+    for path in _walk_docs():
         rel = path.relative_to(ROOT).as_posix()
         kind = _kind_of(path)
         title = _first_heading(path)
@@ -580,8 +602,7 @@ class Markdown:
     # -- links ------------------------------------------------------------- #
 
     def _slug(self, text: str) -> str:
-        base = re.sub(r"[^\w\s-]", "", _plain(text).lower()).strip()
-        base = re.sub(r"[\s_]+", "-", base) or "section"
+        base = _slugify(text)
         n = self.slugs.get(base, 0)
         self.slugs[base] = n + 1
         return base if n == 0 else f"{base}-{n}"
@@ -611,7 +632,7 @@ class Markdown:
         if suffix in RAW_SUFFIXES:
             return _esc(f"/raw?p={rel}", True), "ext"
         frag = f"::{anchor}" if anchor else ""
-        cls = "doc" if suffix == ".md" else "src"
+        cls = "doc" if suffix in DOC_SUFFIXES else "src"
         return _esc(f"#/{rel}{frag}", True), cls
 
     def _img_src(self, src: str) -> str:
@@ -1004,7 +1025,371 @@ def _split_row(line: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Documents — render markdown, or a source file as one highlighted block.
+# Formats. `FORMATS` is the one place that decides what counts as a document —
+# discovery, sidebar titles, link classing, search, and rendering all read from
+# it, so adding a format means adding an entry here and nothing else.
+#
+# Neither of the non-markdown ones is a second parser, deliberately. Org is
+# *translated* into markdown and handed to `Markdown`; a notebook is JSON, so
+# its cells are handed over the same way. Both inherit tables, the TOC, link
+# resolution, and syntax highlighting without the markdown parser growing a
+# single branch — which is the only way to add formats and still keep the rule
+# that it must not grow toward CommonMark.
+# --------------------------------------------------------------------------- #
+
+
+def _as_written(text: str) -> str:
+    """Search default: the file's own bytes are what it says."""
+    return text
+
+
+@dataclass
+class Format:
+    """One document format: how to name it, render it, and search it."""
+
+    suffixes: tuple[str, ...]
+    render: Callable[[str, str], dict]  # (doc rel path, text) → html/toc/mermaid/title
+    title: Callable[[Path], str]  # a cheap title for the sidebar, never a full parse
+    text: Callable[[str], str] = _as_written  # what search greps, when the file isn't it
+    max_bytes: int = 0  # 0 = no ceiling
+
+
+def _render_markdown(rel: str, text: str) -> dict:
+    md = Markdown(rel)
+    html = md.render(text)
+    return {"html": html, "toc": md.toc, "mermaid": md.mermaid, "title": md.title}
+
+
+def _md_title(path: Path) -> str:
+    """A markdown doc's own `# Title`, if it has one near the top."""
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        in_fence = False
+        for _ in range(60):
+            line = fh.readline()
+            if not line:
+                break
+            s = line.strip()
+            if s.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence and s.startswith("# "):
+                return _plain(s[2:].strip())
+    return ""
+
+
+# -- org-mode --------------------------------------------------------------- #
+
+ORG_HEADING_RE = re.compile(r"^(\*+)\s+(.*)$")
+ORG_BLOCK_RE = re.compile(r"^\s*#\+(begin|end)_(\w+)\s*(.*)$", re.I)
+ORG_KEYWORD_RE = re.compile(r"^\s*#\+(\w+):\s*(.*)$")
+ORG_DRAWER_RE = re.compile(r"^\s*:(\w[\w-]*):\s*$")
+ORG_COMMENT_RE = re.compile(r"^\s*#(\s|$)")
+ORG_TABLE_SEP_RE = re.compile(r"^\s*\|[-+|\s]+\|?\s*$")
+ORG_LINK_RE = re.compile(r"\[\[([^\]]+?)\](?:\[([^\]]*?)\])?\]")
+ORG_TAGS_RE = re.compile(r"\s+(?::[\w@%#]+)+:\s*$")
+ORG_DESC_RE = re.compile(r"^(\s*[-+]\s+)(.+?)\s+::\s+(.*)$")
+ORG_VERBATIM_RE = re.compile(r"(?<![\w=~])([=~])(?=\S)([^\n]+?)(?<=\S)\1(?![\w=~])")
+ORG_PARTIAL_RE = re.compile(r"^(\s*(?:[-+]|\d+[.)])\s+)\[-\]")
+ORG_SRC_BLOCKS = ("src", "example", "verse")
+
+
+def _org_href(href: str) -> str:
+    """An org link target, spelled the way markdown would spell it."""
+    href = href.strip()
+    if href.startswith("file:"):
+        href = href[5:]
+    if href.startswith("*"):  # [[*Section Title]] — a link to a heading in this doc
+        return "#" + _slugify(href[1:])
+    if href.startswith("id:"):  # only ever resolvable inside emacs
+        return "#"
+    return href
+
+
+def _org_inline(text: str) -> str:
+    """Org's inline markup as markdown's, with verbatim spans held aside so
+    the emphasis rules cannot reach inside them."""
+    spans: list[str] = []
+
+    def hold(m: re.Match) -> str:
+        spans.append(f"`{m.group(2)}`")
+        return f"\x00{len(spans) - 1}\x00"
+
+    def link(m: re.Match) -> str:
+        href = m.group(1)
+        # a bare [[*Section]] shows the heading, not org's spelling of it
+        label = (m.group(2) or "").strip() or href.lstrip("*").strip()
+        return f"[{label}]({_org_href(href)})"
+
+    text = ORG_VERBATIM_RE.sub(hold, text)
+    text = ORG_LINK_RE.sub(link, text)
+    text = re.sub(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)", r"**\1**", text)
+    text = re.sub(r"(?<![\w/:])/(?=\S)([^/\n]+?)(?<=\S)/(?!\w)", r"*\1*", text)
+    if spans:
+        text = re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], text)
+    return text
+
+
+def _org_to_markdown(text: str) -> tuple[list[str], str]:
+    """Org source → markdown lines, plus `#+TITLE:` if the file declared one.
+
+    Headings shift down a level when there is a title, so the title becomes the
+    H1 and org's top-level sections land on H2 — which is where `Markdown`
+    starts collecting the TOC. Without a title, `* Section` becomes the H1,
+    exactly as `# Section` would in a markdown doc.
+    """
+    lines = text.replace("\r\n", "\n").replace("\t", "    ").split("\n")
+    title = ""
+    for line in lines[:80]:
+        m = ORG_KEYWORD_RE.match(line)
+        if m and m.group(1).lower() == "title":
+            title = m.group(2).strip()
+            break
+
+    out: list[str] = [f"# {_org_inline(title)}"] if title else []
+    shift = 1 if title else 0
+    in_code = skipping = quoting = drawer = False
+
+    for raw in lines:
+        m = ORG_BLOCK_RE.match(raw)
+        if m:
+            opening, kind = m.group(1).lower() == "begin", m.group(2).lower()
+            if kind in ORG_SRC_BLOCKS:
+                info = m.group(3).split()
+                in_code = opening
+                out.append("```" + (info[0] if opening and kind == "src" and info else ""))
+            elif kind == "quote":
+                quoting = opening
+                out.append("")
+            elif kind == "comment":
+                skipping = opening
+            else:  # export, center, anything else — keep the contents, drop the edge
+                out.append("")
+            continue
+        if in_code:
+            out.append(raw)
+            continue
+        if skipping:
+            continue
+
+        m = ORG_DRAWER_RE.match(raw)
+        if m:  # :PROPERTIES: … :END: — bookkeeping emacs keeps, not content
+            drawer = m.group(1).upper() != "END"
+            continue
+        if drawer or ORG_KEYWORD_RE.match(raw) or ORG_COMMENT_RE.match(raw):
+            continue
+
+        m = ORG_HEADING_RE.match(raw)
+        if m:
+            level = min(len(m.group(1)) + shift, 6)
+            head = ORG_TAGS_RE.sub("", m.group(2).strip())
+            out.append(f"{'#' * level} {_org_inline(head)}")
+            continue
+
+        if ORG_TABLE_SEP_RE.match(raw):
+            out.append(raw.replace("+", "|"))
+            continue
+
+        m = ORG_DESC_RE.match(raw)
+        if m:  # `- term :: definition`, which markdown has no spelling for
+            raw = f"{m.group(1)}**{m.group(2)}** — {m.group(3)}"
+        raw = ORG_PARTIAL_RE.sub(r"\1[~]", raw)  # org's half-done box is tome's [~]
+        line = _org_inline(raw)
+        out.append(f"> {line}" if quoting else line)
+
+    return out, title
+
+
+def _render_org(rel: str, text: str) -> dict:
+    lines, title = _org_to_markdown(text)
+    md = Markdown(rel)
+    html = md.blocks(lines)
+    return {"html": html, "toc": md.toc, "mermaid": md.mermaid, "title": md.title or _plain(title)}
+
+
+def _org_title(path: Path) -> str:
+    """`#+TITLE:` wins over the first heading, wherever it turns up."""
+    heading = ""
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for _ in range(60):
+            line = fh.readline()
+            if not line:
+                break
+            m = ORG_KEYWORD_RE.match(line)
+            if m and m.group(1).lower() == "title":
+                return _plain(m.group(2).strip())
+            m = ORG_HEADING_RE.match(line)
+            if m and not heading:
+                heading = _plain(_org_inline(ORG_TAGS_RE.sub("", m.group(2).strip())))
+    return heading
+
+
+# -- jupyter notebooks ------------------------------------------------------ #
+
+NB_OUTPUT_LIMIT = 4000  # characters per output — plots are the point, logs are not
+NB_MAX_BYTES = 10_000_000  # a notebook full of embedded plots is legitimately large
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+B64_RE = re.compile(r"[A-Za-z0-9+/=]+")
+
+# Cached because, unlike every other format, there is no way to read a title out
+# of a notebook without parsing all of it — and `_first_heading` runs for every
+# doc on every tree build. Keyed on size as well as mtime: ext4 stamps mtime
+# from a coarse clock, so two writes inside the same tick are indistinguishable
+# by time alone.
+_NB_TITLES: dict[str, tuple[tuple[float, int], str]] = {}
+
+
+def _nb_load(text: str) -> dict:
+    try:
+        nb = json.loads(text)
+    except ValueError:
+        return {}
+    return nb if isinstance(nb, dict) else {}
+
+
+def _nb_cells(nb: dict) -> list:
+    cells = nb.get("cells")
+    return [c for c in cells if isinstance(c, dict)] if isinstance(cells, list) else []
+
+
+def _nb_source(cell: dict) -> str:
+    src = cell.get("source")
+    return "".join(str(x) for x in src) if isinstance(src, list) else str(src or "")
+
+
+def _nb_text(value: object, sep: str = "") -> str:
+    text = sep.join(str(x) for x in value) if isinstance(value, list) else str(value or "")
+    text = ANSI_RE.sub("", text)
+    if len(text) > NB_OUTPUT_LIMIT:
+        text = f"{text[:NB_OUTPUT_LIMIT]}\n… (truncated)"
+    return text.rstrip("\n")
+
+
+def _nb_language(nb: dict) -> str:
+    meta = nb.get("metadata") or {}
+    info = meta.get("language_info") or {}
+    spec = meta.get("kernelspec") or {}
+    for name in (info.get("name"), spec.get("language"), spec.get("name")):
+        if isinstance(name, str) and name.strip():
+            name = name.strip().lower()
+            # "python3" names a kernel, not a language the highlighter knows
+            return name if name in LANG_SPECS or name in LANG_ALIAS else re.sub(r"\d+$", "", name)
+    return "python"
+
+
+def _nb_png(value: object) -> str:
+    """The base64 payload of a PNG output, or "" if it isn't one — it goes
+    straight into a data: URI, so anything that isn't base64 stays out."""
+    if not value:
+        return ""
+    joined = "".join(str(x) for x in value) if isinstance(value, list) else str(value)
+    data = re.sub(r"\s+", "", joined)
+    return data if B64_RE.fullmatch(data) else ""
+
+
+def _nb_out(text: str, cls: str = "") -> str:
+    return f'<div class="cb out{cls}"><pre><code>{_esc(text)}</code></pre></div>'
+
+
+def _nb_outputs(outputs: object) -> list[str]:
+    """A cell's outputs, in the order the notebook recorded them. Anything
+    richer than text or a PNG is skipped rather than guessed at."""
+    parts: list[str] = []
+    for out in outputs if isinstance(outputs, list) else []:
+        if not isinstance(out, dict):
+            continue
+        kind = out.get("output_type")
+        if kind == "stream":
+            text = _nb_text(out.get("text"))
+            if text:
+                parts.append(_nb_out(text))
+        elif kind in ("execute_result", "display_data"):
+            data = out.get("data") or {}
+            png = _nb_png(data.get("image/png"))
+            if png:
+                parts.append(
+                    f'<p class="nb-img"><img src="data:image/png;base64,{png}" '
+                    f'alt="cell output" loading="lazy"></p>'
+                )
+                continue
+            text = _nb_text(data.get("text/plain"))
+            if text:
+                parts.append(_nb_out(text))
+        elif kind == "error":
+            trace = _nb_text(out.get("traceback"), "\n")
+            parts.append(_nb_out(trace or f"{out.get('ename')}: {out.get('evalue')}", " err"))
+    return parts
+
+
+def _render_notebook(rel: str, text: str) -> dict:
+    """Notebooks are JSON, so this is assembly rather than parsing: markdown
+    cells go through one `Markdown` instance (so the TOC and slugs accumulate
+    across the whole notebook), code cells through the highlighter a fence uses.
+    """
+    nb = _nb_load(text)
+    if not nb:
+        return {"html": "<p>this notebook is not valid JSON</p>", "toc": [],
+                "mermaid": False, "title": ""}
+    md = Markdown(rel)
+    lang = _nb_language(nb)
+    parts: list[str] = []
+    for cell in _nb_cells(nb):
+        source = _nb_source(cell)
+        if cell.get("cell_type") == "markdown":
+            parts.append(md.render(source))
+        elif cell.get("cell_type") == "code":
+            if source.strip():
+                parts.append(
+                    f'<div class="cb"><span class="lang">{_esc(lang)}</span>'
+                    f'<button class="copy" type="button">copy</button>'
+                    f'<pre><code class="lang-{_esc(lang, True)}">'
+                    f"{highlight(source, lang)}</code></pre></div>"
+                )
+            parts.extend(_nb_outputs(cell.get("outputs")))
+    return {"html": "\n".join(parts), "toc": md.toc, "mermaid": md.mermaid, "title": md.title}
+
+
+def _nb_search_text(text: str) -> str:
+    """What a notebook actually says — searching its JSON would match base64
+    image data and metadata keys, which is worse than not searching it at all."""
+    return "\n".join(_nb_source(c) for c in _nb_cells(_nb_load(text)))
+
+
+def _ipynb_title(path: Path) -> str:
+    key = str(path)
+    stat = path.stat()
+    stamp = (stat.st_mtime, stat.st_size)
+    hit = _NB_TITLES.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    title = ""
+    for cell in _nb_cells(_nb_load(path.read_text(encoding="utf-8", errors="replace"))):
+        if cell.get("cell_type") != "markdown":
+            continue
+        for line in _nb_source(cell).split("\n"):
+            if line.strip().startswith("# "):
+                title = _plain(line.strip()[2:])
+                break
+        if title:
+            break
+    _NB_TITLES[key] = (stamp, title)
+    return title
+
+
+MARKDOWN = Format((".md", ".markdown", ".mdown", ".mkd"), _render_markdown, _md_title)
+
+FORMATS = (
+    MARKDOWN,
+    Format((".org",), _render_org, _org_title),
+    Format((".ipynb",), _render_notebook, _ipynb_title, _nb_search_text, NB_MAX_BYTES),
+)
+
+# suffix → format, in registration order, so `_find_stem` prefers a README.md
+# over a README.org when a directory happens to hold both.
+DOC_SUFFIXES = {suffix: fmt for fmt in FORMATS for suffix in fmt.suffixes}
+
+
+# --------------------------------------------------------------------------- #
+# Documents — render any registered format, or a source file as one block.
 # --------------------------------------------------------------------------- #
 
 
@@ -1051,16 +1436,18 @@ def render_doc(rel: str) -> dict:
         return {"error": f"not found: {rel}"}
     suffix = path.suffix.lower()
     stat = path.stat()
-    if suffix == ".md":
-        md = Markdown(rel)
-        body = md.render(path.read_text(encoding="utf-8", errors="replace"))
+    fmt = DOC_SUFFIXES.get(suffix)
+    if fmt is not None:
+        if fmt.max_bytes and stat.st_size > fmt.max_bytes:
+            return {"error": f"{rel} is too large to display ({stat.st_size // 1024} KB)"}
+        out = fmt.render(rel, path.read_text(encoding="utf-8", errors="replace"))
         return {
             "path": rel,
             "abs": str(path),
-            "title": md.title or _first_heading(path),
-            "html": body,
-            "toc": md.toc,
-            "mermaid": md.mermaid,
+            "title": out["title"] or _first_heading(path),
+            "html": out["html"],
+            "toc": out["toc"],
+            "mermaid": out["mermaid"],
             "mtime": stat.st_mtime,
             "kind": _kind_of(path),
             "source": False,
@@ -1096,6 +1483,9 @@ def search(query: str, limit: int = 60) -> list[dict]:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            fmt = DOC_SUFFIXES.get(path.suffix.lower())
+            if fmt is not None:
+                text = fmt.text(text)
             low = text.lower()
             if q not in low:
                 continue
@@ -1128,7 +1518,7 @@ def version_stamp() -> str:
     """Cheap fingerprint of every doc's mtime — drives the browser's live reload."""
     acc = 0.0
     count = 0
-    for path in _walk_md():
+    for path in _walk_docs():
         try:
             acc += path.stat().st_mtime
             count += 1
@@ -1220,12 +1610,16 @@ class Handler(BaseHTTPRequestHandler):
 def _primary_doc(d: Path) -> str:
     """The doc that best represents a directory — its README, SPEC, or first."""
     for stem in CFG.pinned:
-        for suffix in (".md", ".markdown"):
-            p = d / f"{stem}{suffix}"
-            if p.is_file():
-                return p.relative_to(ROOT).as_posix()
-    shallow = sorted(d.glob("*.md"))
-    deep = (p for p in sorted(d.rglob("*.md")) if not set(p.parts) & CFG.skip_dirs)
+        p = _find_stem(d, stem)
+        if p is not None:
+            return p.relative_to(ROOT).as_posix()
+    shallow = sorted(p for p in d.glob("*") if p.suffix.lower() in DOC_SUFFIXES and p.is_file())
+    deep = (
+        p
+        for suffix in DOC_SUFFIXES
+        for p in sorted(d.rglob(f"*{suffix}"))
+        if not set(p.parts) & CFG.skip_dirs
+    )
     found = next(iter(shallow), None) or next(deep, None)
     return found.relative_to(ROOT).as_posix() if found else ""
 
@@ -1677,6 +2071,18 @@ PAGE = r"""<!doctype html>
   .cb .copy:hover{color:var(--text);border-color:var(--line2)}
   .cb.src{max-width:none}
   .cb.src pre{font-size:12.5px;line-height:1.6}
+
+  /* Notebook cell output. Quieter than the code that produced it, and hung off
+     the bottom of it so it reads as belonging to that cell rather than standing
+     on its own. Plots get a white plate — matplotlib writes transparent PNGs,
+     which are invisible on every one of the dark themes. */
+  .cb.out{background:transparent;border:0;border-left:2px solid var(--line2);
+    border-radius:0;margin:-12px 0 20px 2px}
+  .cb.out pre{padding:9px 15px;font-size:12.5px;color:var(--sub)}
+  .cb.out.err{border-left-color:var(--red)}
+  .cb.out.err pre{color:var(--red)}
+  .nb-img{margin:-6px 0 20px}
+  .nb-img img{max-width:100%;border-radius:8px;background:#fff}
 
   .c-kw{color:var(--mauve)} .c-str{color:var(--green)} .c-num{color:var(--peach)}
   .c-cmt{color:var(--dim);font-style:italic} .c-ty{color:var(--yellow)}

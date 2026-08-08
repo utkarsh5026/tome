@@ -10,8 +10,9 @@ tome --open
 
 ![The reading view](assets/reading.png)
 
-That's it. `tome` finds the repo root, discovers every `.md` under it, groups them
-the way the repo is actually laid out, and serves a fast reader on `127.0.0.1`.
+That's it. `tome` finds the repo root, discovers every document under it —
+markdown, org-mode, Jupyter notebooks — groups them the way the repo is actually
+laid out, and serves a fast reader on `127.0.0.1`.
 Edit a doc in your editor and the page re-renders in place, keeping your scroll
 position.
 
@@ -192,6 +193,23 @@ A focused GFM subset, chosen by looking at what real repo docs actually contain:
 - **links that resolve**: `[router.rs](../src/router.rs)` opens the real source
   file, syntax-highlighted, inside the reader. Broken links render in red, so a
   doc that's drifted from the code is visible at a glance.
+
+### Beyond markdown
+
+`.org` and `.ipynb` files sit in the sidebar next to the markdown, and neither
+one gets a parser of its own:
+
+- **org-mode** (`.org`) is translated into markdown and handed to the same
+  renderer, so headings, `#+begin_src` blocks, tables, checkboxes, and
+  `[[file:…][links]]` behave exactly as their markdown spellings do. `#+TITLE:`
+  becomes the document title; drawers, keywords, and comments are dropped.
+- **Jupyter notebooks** (`.ipynb`) render cell by cell — markdown cells through
+  the markdown renderer, code cells through the syntax highlighter, and each
+  cell's outputs below it: stdout, `text/plain` reprs, PNG plots, and
+  tracebacks with their ANSI colour codes stripped. Search reads what the cells
+  say rather than the surrounding JSON.
+
+Markdown also answers to `.markdown`, `.mdown`, and `.mkd`.
 
 ---
 
