@@ -97,6 +97,24 @@ MIME = {
 STATUS_RE = re.compile(r"<!--\s*status:(.*?)-->", re.DOTALL)
 
 
+def say(msg: str, *, err: bool = False) -> None:
+    """`print`, for a stream whose encoding may not cover what we're printing.
+
+    Windows hands back the legacy code page whenever stdout is redirected, and
+    there an emoji is a `UnicodeEncodeError` rather than a cosmetic problem —
+    `tome > log.txt` used to die on its own startup banner, traceback and all.
+    So drop whatever the stream can't represent and print the words.
+    """
+    stream = sys.stderr if err else sys.stdout
+    try:
+        print(msg, file=stream, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "ascii"
+        plain = msg.encode(enc, "ignore").decode(enc)
+        # Dropping a leading emoji leaves the line indented by its ghost.
+        print("\n".join(" ".join(ln.split()) for ln in plain.splitlines()), file=stream, flush=True)
+
+
 # --------------------------------------------------------------------------- #
 # Configuration — all optional. The defaults are chosen so that the common
 # case (`cd somewhere && tome`) needs no config file at all; `.tome.json` only
@@ -170,10 +188,10 @@ def load_config(root: Path) -> Config:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        print(f"warning: ignoring {CONFIG_NAME} — {e}", file=sys.stderr)
+        say(f"warning: ignoring {CONFIG_NAME} — {e}", err=True)
         return cfg
     if not isinstance(raw, dict):
-        print(f"warning: ignoring {CONFIG_NAME} — expected a JSON object", file=sys.stderr)
+        say(f"warning: ignoring {CONFIG_NAME} — expected a JSON object", err=True)
         return cfg
 
     cfg.title = str(raw.get("title", "") or "")
@@ -1243,7 +1261,7 @@ def _resolve_start(arg: str | None) -> str:
         for d in g.docs:
             if low in d.rel.lower() or low in d.title.lower():
                 return d.rel
-    print(f"warning: nothing matched {arg!r} — opening the repo root", file=sys.stderr)
+    say(f"warning: nothing matched {arg!r} — opening the repo root", err=True)
     return CFG.home
 
 
@@ -1255,7 +1273,7 @@ def _bind(port: int, span: int = 20) -> tuple[ThreadingHTTPServer, int] | None:
             return ThreadingHTTPServer(("127.0.0.1", candidate), Handler), candidate
         except OSError as e:
             last = e
-    print(f"error: no free port in {port}–{port + span - 1} — {last}", file=sys.stderr)
+    say(f"error: no free port in {port}–{port + span - 1} — {last}", err=True)
     return None
 
 
@@ -1287,10 +1305,10 @@ def main(argv: list[str]) -> int:
     if args.init_config:
         dest = root / CONFIG_NAME
         if dest.exists():
-            print(f"{dest} already exists — leaving it alone", file=sys.stderr)
+            say(f"{dest} already exists — leaving it alone", err=True)
             return 1
         dest.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        print(f"✅ wrote {dest}")
+        say(f"✅ wrote {dest}")
         return 0
 
     configure(load_config(root))
@@ -1309,18 +1327,17 @@ def main(argv: list[str]) -> int:
     if start := _resolve_start(args.target):
         url += f"#/{start}"
 
-    print(f"📖 {CFG.name} docs → {url}")
-    print(
+    say(f"📖 {CFG.name} docs → {url}")
+    say(
         f"  {total} markdown file{'s' * (total != 1)} · live-reloads on save"
-        " · ctrl-K to search · ctrl-C to stop",
-        flush=True,
+        " · ctrl-K to search · ctrl-C to stop"
     )
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 bye")
+        say("\n👋 bye")
         srv.shutdown()
     return 0
 

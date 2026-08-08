@@ -107,11 +107,14 @@ leading H1 and tagline because the hero restates them (it warns if the README
 stops opening that way), and it rewrites `/raw?p=` image URLs and `#/` doc links,
 which only exist inside the running app, into plain relative and GitHub paths.
 
-## Releasing to PyPI
+## Releasing
+
+One tag ships two things. `.github/workflows/publish.yml` fires on any tag
+matching `v*.*.*` and runs both `publish` (the wheel to PyPI) and
+`binaries` → `release` (standalone executables to the GitHub Release).
 
 The package is published as `tome-docs` (the `tome` name on PyPI was already
-taken). `.github/workflows/publish.yml` builds and publishes on any tag matching
-`v*.*.*`, using PyPI trusted publishing (OIDC) — there is no API token in this
+taken), using PyPI trusted publishing (OIDC) — there is no API token in this
 repo's secrets, and there should never be one.
 
 To cut a release: bump `__version__` in `tome.py` (the single source hatchling
@@ -133,6 +136,34 @@ publisher** at <https://pypi.org/manage/account/publishing/> — project name
 from that pending publisher. Until this is registered, the workflow's `publish`
 job will fail with an authentication error — the `build` job works regardless,
 since it doesn't touch PyPI.
+
+### The binaries
+
+PyInstaller, one job per target OS, because it cannot cross-compile. `make
+binary` builds the same thing locally for whatever machine you're on; keep its
+flags in step with the workflow, which is the one that actually ships.
+
+Four things about that matrix are load-bearing, and all four are cheap to break:
+
+- **`fail-fast: false`.** The default cancels every sibling the moment one
+  fails, throwing away four good binaries because one runner was flaky.
+- **The excludes stay timid.** `http.server` imports `email` to parse headers,
+  so excluding it produces a binary that starts fine, prints `--version` fine,
+  and dies on the first request. That exact mistake is why the smoke test
+  serves a page instead of just checking `--version`.
+- **The smoke test reads the port out of tome's own banner.** `_bind()` walks
+  forward when a port is busy, so asking for 7979 and curling 7979 can test a
+  different process entirely.
+- **`ubuntu-22.04`, not `24.04`.** The build host sets the glibc floor.
+
+`release` deliberately depends on `binaries` alone, not on `publish` — until the
+pending publisher above is registered, `publish` fails, and the binaries have no
+reason to go down with it.
+
+The binaries are unsigned. macOS Gatekeeper and Windows SmartScreen both warn on
+first run, and the README tells users how to get past it. Fixing that properly
+means an Apple Developer account ($99/yr) for notarization and a code-signing
+certificate for Windows; both are additive later and neither blocks a release.
 
 ## Regenerating the screenshots
 
