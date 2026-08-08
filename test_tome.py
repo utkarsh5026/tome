@@ -7,7 +7,9 @@ guard) is a function of a real directory layout.
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 import tempfile
 import unittest
 import urllib.request
@@ -324,6 +326,45 @@ class TestServer(unittest.TestCase):
 
     def test_secret_is_not_served(self):
         self.assertIn("error", json.loads(self.get("/api/doc?p=.env")[1]))
+
+
+class TestSay(unittest.TestCase):
+    """Windows hands back a legacy code page on a redirected stdout, and the
+    banner is full of emoji. Printing it must never be what kills the process."""
+
+    @staticmethod
+    def capture(msg: str, encoding: str, *, err: bool = False) -> str:
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding=encoding, errors="strict", newline="")
+        attr = "stderr" if err else "stdout"
+        saved = getattr(sys, attr)
+        setattr(sys, attr, stream)
+        try:
+            tome.say(msg, err=err)
+        finally:
+            setattr(sys, attr, saved)
+        stream.flush()
+        return raw.getvalue().decode(encoding)
+
+    def test_utf8_stream_keeps_the_emoji(self):
+        self.assertIn("📖", self.capture("📖 tome docs → http://x", "utf-8"))
+
+    def test_legacy_codepage_degrades_instead_of_raising(self):
+        out = self.capture("📖 tome docs → http://127.0.0.1:7979/", "cp1252")
+        self.assertNotIn("📖", out)
+        self.assertIn("tome docs", out)
+        self.assertIn("http://127.0.0.1:7979/", out)
+
+    def test_ascii_stream_survives_every_decorated_line(self):
+        # every non-ASCII character tome prints, in one go
+        out = self.capture("📖 ✅ 👋 a — b – c · d → e", "ascii")
+        self.assertEqual(out.strip(), "a b c d e")
+
+    def test_no_ghost_indent_where_a_dropped_emoji_used_to_be(self):
+        self.assertEqual(self.capture("✅ wrote .tome.json", "ascii").strip(), "wrote .tome.json")
+
+    def test_err_routes_to_stderr(self):
+        self.assertIn("warning: x", self.capture("warning: x — y", "ascii", err=True))
 
 
 if __name__ == "__main__":
