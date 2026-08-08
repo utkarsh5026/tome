@@ -1,0 +1,132 @@
+#+TITLE: Org-mode Tour
+#+AUTHOR: nobody in particular
+#+OPTIONS: toc:nil
+
+This file is org, not markdown, and it exists so the translator has something
+real to render. Open it in the reader (=python3 tome.py=) and check each
+section against what the source says it should do.
+
+Org is not parsed. It is rewritten into markdown line by line and handed to
+the same renderer everything else goes through, so anything markdown can do
+here, org gets for free — and anything markdown cannot do, org does not get.
+
+* Headings and the table of contents                             :structure:
+:PROPERTIES:
+:CUSTOM_ID: headings
+:END:
+
+=#+TITLE:= above became the H1, so these top-level =*= sections are H2 and show
+up in the table of contents on the right. Without a title the first =*= section
+would have been the H1, exactly as =#= is in a markdown doc.
+
+Four things in the source of this section should have left no trace in the
+page: the properties drawer under the heading, the =#+AUTHOR:= and =#+OPTIONS:=
+lines at the top of the file, the tags on the heading above (=:structure:=),
+and the comment line immediately after this paragraph.
+
+# a comment line, which should not appear in the rendered page
+
+If the sentence above is followed straight by *Emphasis*, all four are gone.
+
+** Emphasis
+
+Org spells emphasis differently from markdown: *bold*, /italic/, =verbatim=,
+and ~code~ all get rewritten. Emphasis is not allowed to reach inside a
+verbatim span, so =a/b/c= keeps its slashes and ~x*y*z~ keeps its stars.
+
+A bare URL still autolinks: https://github.com/utkarsh5026/tome
+
+** Links
+
+Org links carry their label on the outside, and all four shapes resolve the
+way the markdown spellings do:
+
+- [[file:../tome.py][tome.py]] — a source file, opened highlighted in the reader
+- [[../README.md][the README]] — another doc, opened as a doc
+- [[https://orgmode.org][orgmode.org]] — external, opens in a new tab
+- [[*Tables]] — a heading in this file, with no label, so the heading names it
+- [[file:does-not-exist.md][a broken link]] — red, like every broken link
+
+* Blocks
+
+** Source blocks
+
+=#+begin_src <lang>= becomes a fence, so it reaches the same highlighter:
+
+#+begin_src rust
+impl TokenBucket {
+    fn try_take(&mut self, n: u32) -> bool {
+        if self.tokens >= n { self.tokens -= n; true } else { false }
+    }
+}
+#+end_src
+
+#+begin_src python
+def refill(bucket, elapsed):
+    """Tokens accrue continuously, but never past the cap."""
+    return min(bucket.capacity, bucket.tokens + elapsed * bucket.rate)
+#+end_src
+
+An =#+begin_example= block has no language, so it renders unhighlighted:
+
+#+begin_example
+$ tome --root ~/work/api --port 7979
+📖 tome  api  →  http://127.0.0.1:7979/
+#+end_example
+
+** Quotes
+
+#+begin_quote
+Backpressure is a feature. A queue that never rejects is a queue that has
+already failed, it just hasn't told you yet.
+#+end_quote
+
+* Tables
+
+Org draws its separator with a =+= at each column boundary; markdown wants a
+=|=, which is the one character the translator has to fix:
+
+| knob      | default | what it does                          |
+|-----------+---------+---------------------------------------|
+| capacity  |      10 | how many tokens fit in the bucket     |
+| rate      |       5 | tokens added per second               |
+| burst     |    true | whether a full bucket may drain at once |
+
+* Lists
+
+Plain and nested:
+
+- discovery walks every registered format under the repo root
+  - markdown, org, and notebooks
+  - skipping =node_modules=, =.git=, and =.ipynb_checkpoints=
+- rendering happens in-process, with no subprocess and no pip install
+
+Ordered:
+
+1. =find_root= walks up from the cwd
+2. =build_tree= walks down from there
+3. the browser asks =/api/tree= for the result
+
+Description lists, which markdown has no spelling for, so the term becomes
+bold and the =::= becomes a dash:
+
+- capacity :: how many tokens the bucket holds when full
+- rate :: how many tokens are added per second
+- burst :: whether a full bucket may be drained in a single request
+
+Checkboxes, including org's half-done =[-]=, which maps onto the same
+three states the markdown parser already had:
+
+- [X] translate headings, blocks, and tables
+- [-] inline markup, minus the shapes markdown cannot express
+- [ ] anything requiring an actual org parser
+
+* What is deliberately missing
+
+Org is a much larger language than this handles, and the rule when the
+translator meets something it does not know is markdown's rule: degrade to a
+paragraph, never mangle the page. Footnotes, macros, =#+INCLUDE:=, babel
+results, radio targets, and timestamps all fall through as plain text.
+
+That is the trade. A real org parser is a much bigger program than tome is
+allowed to be, and a bad one would drift from the markdown renderer besides.

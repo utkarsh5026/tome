@@ -27,7 +27,7 @@ Inline styles: **bold**, *italic*, ***bold italic***, ~~strikethrough~~, and
 
 Unordered, with nesting:
 
-- discovery walks every `*.md` under the repo root
+- discovery walks every document under the repo root
   - skipping `skip_dirs` like `node_modules` and `.git`
   - grouping monorepo packages by their `group_dirs` prefix
 - rendering happens in-process, no subprocess, no pip install
