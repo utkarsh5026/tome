@@ -102,15 +102,17 @@ Needs Python 3.9+. That's the entire dependency list.
 Every release also ships a standalone executable with the interpreter baked in —
 one file, nothing to install, no Python anywhere on the machine.
 
-**[Grab the latest release →](https://github.com/utkarsh5026/tome/releases/latest)**
+Pick your platform — each link downloads the newest build directly:
 
-| platform | file |
+| platform | download |
 | --- | --- |
-| Linux · x86_64 | `tome-linux-x86_64` |
-| Linux · ARM64 | `tome-linux-aarch64` |
-| macOS · Intel | `tome-macos-x86_64` |
-| macOS · Apple Silicon | `tome-macos-arm64` |
-| Windows · x86_64 | `tome-windows-x86_64.exe` |
+| **Windows** · x86_64 | [tome-windows-x86_64.exe](https://github.com/utkarsh5026/tome/releases/latest/download/tome-windows-x86_64.exe) |
+| **macOS** · Apple Silicon | [tome-macos-arm64](https://github.com/utkarsh5026/tome/releases/latest/download/tome-macos-arm64) |
+| **macOS** · Intel | [tome-macos-x86_64](https://github.com/utkarsh5026/tome/releases/latest/download/tome-macos-x86_64) |
+| **Linux** · x86_64 | [tome-linux-x86_64](https://github.com/utkarsh5026/tome/releases/latest/download/tome-linux-x86_64) |
+| **Linux** · ARM64 | [tome-linux-aarch64](https://github.com/utkarsh5026/tome/releases/latest/download/tome-linux-aarch64) |
+
+On Windows, double-clicking works — it serves whatever folder it sits in.
 
 ```bash
 # macOS / Linux — make it executable and put it on PATH
@@ -118,12 +120,12 @@ chmod +x tome-macos-arm64
 mv tome-macos-arm64 ~/.local/bin/tome
 ```
 
-On Windows, double-clicking works too — it serves whatever folder it sits in.
-
 The binaries are unsigned, so the OS will say so the first time: on macOS,
 right-click → **Open** once (or `xattr -d com.apple.quarantine tome`); on
-Windows, SmartScreen's **More info → Run anyway**. A `SHA256SUMS` file is
-attached to every release if you'd rather verify the download.
+Windows, SmartScreen's **More info → Run anyway**. Checksums for every file
+live in [SHA256SUMS](https://github.com/utkarsh5026/tome/releases/latest/download/SHA256SUMS),
+and [the release page](https://github.com/utkarsh5026/tome/releases/latest) has
+the rest.
 
 Worth knowing what you're trading: the binary is ~10 MB against the source's
 100 KB, because most of it is Python itself. If you already have an interpreter,
