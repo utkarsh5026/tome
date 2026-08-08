@@ -163,10 +163,29 @@ tome README.md            # open straight to a file
 tome docs/adr             # …or a directory (opens its README/SPEC)
 tome 10                   # …or a numbered package: projects/10-*
 tome --root ~/work/api    # serve a repo you're not standing in
+tome --export docs.html   # the whole repo as one file, then exit
 ```
 
 Run it in several repos at once — the port auto-advances, and each repo
 remembers its own reading position independently.
+
+### Send someone the docs
+
+`--export` writes **one self-contained HTML file** — every document, the
+sidebar, the search, the themes, and any images as `data:` URIs:
+
+```bash
+tome --export handbook.html
+# ✅ wrote handbook.html (1.4 MB)
+#   43 docs · 7 linked source files · 12 images inlined · opens with no server
+```
+
+It is the same page the server sends, reading a baked-in copy of the same
+payloads instead of calling `/api/…`, so ⌘K search and the source-file links
+still work — offline, with no Python on the far end. Attach it to a release,
+mail it, or commit it to Pages. The source files that your docs link to come
+along too (small ones, and never a secret), because a doc reader whose links
+stop working is not a doc reader.
 
 ### Keys
 
@@ -211,6 +230,39 @@ one gets a parser of its own:
 
 Markdown also answers to `.markdown`, `.mdown`, and `.mkd`.
 
+### What a doc knows about itself
+
+Three things show up around the prose rather than in it:
+
+- **Front matter.** A `---` block at the top of a markdown file sets `title`,
+  `tags`, `order`, and `draft`. It is stripped from the page instead of being
+  rendered as a stray rule, and it is deliberately *not* YAML — there is none
+  in the standard library, so it reads `key: value`, `[a, b]`, and `- a` lists,
+  and skips anything else rather than guessing.
+
+  ```markdown
+  ---
+  title: Token Bucket
+  tags: [rate-limiting, algorithms]
+  order: 2
+  draft: true
+  ---
+  ```
+
+  `title` names the doc in the sidebar and the tab. `order` sorts it inside its
+  section and outranks the `pinned` convention, which is only a guess about
+  reading order. `tags` become chips you can click to filter the sidebar.
+  `draft` dims the entry and marks the page.
+
+- **Last changed.** One `git log` for the whole repo tells each doc when it
+  last changed and who changed it, shown under the breadcrumb. No git, no
+  repo, or `"git": false` falls back to the file's mtime — nothing breaks, you
+  just lose the name.
+
+- **Backlinks.** Every doc gets a **linked from** list of the docs that point
+  at it, built from the same link resolution the renderer uses. Source files
+  get them too: opening `router.rs` shows you which spec sent you there.
+
 ---
 
 ## Configuration
@@ -245,6 +297,7 @@ tome --init-config
 | `theme` | default theme for people who haven't picked one | `mocha` |
 | `home` | doc to open on a fresh visit | the root README |
 | `editor` | what the **edit** button opens: `vscode`, `cursor`, `zed`, `idea`, `sublime`, `none`, or a `{path}` template | `vscode` |
+| `git` | read "last changed by" from git; `false` uses file mtimes and shows no author | `true` |
 
 ### How grouping works
 

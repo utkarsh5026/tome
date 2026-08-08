@@ -24,6 +24,7 @@ Usage:
     tome docs/adr            # open straight to a path
     tome 10                  # or to a numbered package (`projects/10-*`)
     tome --root ~/work/api   # serve a repo you are not standing in
+    tome --export docs.html  # the whole repo as one file you can send someone
 
 Everything is optional: with no config at all it finds the repo root, groups
 what it finds, and serves. Drop a `.tome.json` at the root to override the
@@ -36,11 +37,13 @@ from the repo, so it is not for exposing on a network.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import html as html_mod
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -138,6 +141,7 @@ class Config:
     home: str = ""  # doc to open when there is no hash and no saved position
     editor: str = "vscode"
     icon: str = "📖"  # emoji favicon, so tabs from different repos are distinct
+    git: bool = True  # read "last changed" from git; off falls back to mtimes
 
     @property
     def name(self) -> str:
@@ -204,6 +208,8 @@ def load_config(root: Path) -> Config:
     cfg.home = str(raw.get("home", "") or "")
     cfg.editor = str(raw.get("editor", "") or cfg.editor)
     cfg.icon = str(raw.get("icon", "") or cfg.icon)
+    if isinstance(raw.get("git"), bool):
+        cfg.git = raw["git"]
     if isinstance(raw.get("pinned"), list):
         cfg.pinned = tuple(str(x).upper() for x in raw["pinned"])
     if isinstance(raw.get("groupDirs"), list):
@@ -218,7 +224,7 @@ def load_config(root: Path) -> Config:
 
 def configure(cfg: Config) -> None:
     """Publish the resolved config to the module globals the rest of it reads."""
-    global ROOT, CFG, KIND_ORDER
+    global ROOT, CFG, KIND_ORDER, _GIT, _INDEX
     # ROOT must be fully resolved, because `safe_path` compares it against
     # resolved paths. Windows 8.3 short names (`RUNNER~1`) and macOS's
     # /tmp → /private/tmp symlink both make an unresolved root fail that
@@ -229,6 +235,10 @@ def configure(cfg: Config) -> None:
     KIND_ORDER = {kind: i for i, kind in enumerate(cfg.pinned)}
     KIND_ORDER["doc"] = len(cfg.pinned)
     KIND_ORDER["other"] = len(cfg.pinned) + 1
+    # Everything cached below is cached about *this* repo, and configure() is
+    # the one moment it can become a different one.
+    _GIT = _INDEX = None
+    _NB_TITLES.clear()
 
 
 SAMPLE_CONFIG = """{
@@ -257,6 +267,11 @@ class Doc:
     label: str  # what the sidebar shows
     kind: str  # a pinned stem (README, SPEC, …) | doc | other
     group: str  # group id it belongs to
+    tags: list[str] = field(default_factory=list)  # front matter's, if it has any
+    draft: bool = False
+    order: int | None = None  # front matter's `order:`, which outranks `pinned`
+    updated: float = 0.0  # last commit's author time, or the file's mtime
+    by: str = ""  # last author, when this is a git repo
 
 
 @dataclass
@@ -313,6 +328,18 @@ def _first_heading(path: Path) -> str:
         if title:
             return title
     return path.stem.replace("-", " ").replace("_", " ")
+
+
+def _doc_meta(path: Path) -> dict:
+    """A doc's front matter, for the formats that carry any. Never raises: an
+    unreadable file costs its metadata, not the whole tree."""
+    fmt = DOC_SUFFIXES.get(path.suffix.lower())
+    if fmt is None:
+        return {}
+    try:
+        return fmt.meta(path)
+    except OSError:
+        return {}
 
 
 def _plain(text: str) -> str:
@@ -409,17 +436,40 @@ def build_tree() -> list[Group]:
             groups[gid] = g
         return groups[gid]
 
+    git = git_info()
     for path in _walk_docs():
         rel = path.relative_to(ROOT).as_posix()
         kind = _kind_of(path)
         title = _first_heading(path)
+        meta = _doc_meta(path)
+        at, by = _last_change(rel, path, git)
         g = group_for(rel)
         g.docs.append(
-            Doc(rel=rel, title=title, label=_doc_label(path, kind, title), kind=kind, group=g.gid)
+            Doc(
+                rel=rel,
+                title=title,
+                label=_doc_label(path, kind, title),
+                kind=kind,
+                group=g.gid,
+                tags=meta_list(meta, "tags"),
+                draft=meta_bool(meta, "draft"),
+                order=meta_int(meta, "order"),
+                updated=at,
+                by=by,
+            )
         )
 
+    # A doc that says `order: 2` means it, so it outranks the pinned convention
+    # — which is only a guess about what the reading order probably is.
     for g in groups.values():
-        g.docs.sort(key=lambda d: (KIND_ORDER.get(d.kind, 99), d.rel))
+        g.docs.sort(
+            key=lambda d: (
+                0 if d.order is not None else 1,
+                d.order if d.order is not None else 0,
+                KIND_ORDER.get(d.kind, 99),
+                d.rel,
+            )
+        )
 
     def gkey(g: Group) -> tuple:
         if g.gid == "root":
@@ -429,6 +479,104 @@ def build_tree() -> list[Group]:
         return (2, g.title)
 
     return sorted(groups.values(), key=gkey)
+
+
+# --------------------------------------------------------------------------- #
+# Git metadata — who last touched a doc, and when. Strictly an enrichment: no
+# git binary, no repository, a repo with no commits, or `"git": false` all end
+# at the same place, which is the file's mtime and no author.
+# --------------------------------------------------------------------------- #
+
+GIT_LOG_LIMIT = 4000  # commits to look back over — a bound, so a huge repo stays fast
+GIT_TIMEOUT = 5  # seconds; a pathological repo must not hang the tree build
+
+_GIT: tuple[str, dict[str, dict]] | None = None
+
+
+def _git_stamp() -> str:
+    """A "has anything been committed" key, without spawning git to ask.
+
+    Both files move on any commit, checkout, or `git add`. Where `.git` is a
+    file rather than a directory — worktrees, submodules — there is nothing
+    cheap to stat, so the key is constant and the cache holds for the run.
+    """
+    marks = []
+    for name in ("HEAD", "index"):
+        try:
+            marks.append(str((ROOT / ".git" / name).stat().st_mtime))
+        except OSError:
+            marks.append("")
+    return f"{ROOT}|" + "|".join(marks)
+
+
+def _git_log() -> str:
+    """`git log` over the whole repo, or "" for any reason whatsoever.
+
+    Not being a git repo is the normal case for plenty of directories worth
+    reading, so every failure here is silent — the caller has a fallback.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(ROOT),
+                # Without this, a path with a non-ASCII byte comes back C-quoted
+                # ("caf\303\251.md") and matches nothing in the tree.
+                "-c", "core.quotePath=false",
+                "log", f"-n{GIT_LOG_LIMIT}", "--no-merges", "--name-only",
+                # ROOT can sit below the git root (`--root docs/`, or a weak
+                # marker won the search), and paths have to line up with it.
+                "--relative", "--format=\x01%at\x01%an\x01%h",
+            ],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT,
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def git_info() -> dict[str, dict]:
+    """repo-relative path → {at, by, id} of the commit that last touched it.
+
+    One `git log --name-only` for the entire repo, not one call per file: at a
+    couple of hundred docs the per-file version costs seconds and this costs
+    one call. Paths git never mentions — uncommitted, or older than
+    `GIT_LOG_LIMIT` — are simply absent, and `_last_change` uses the mtime.
+    """
+    global _GIT
+    if not CFG.git:
+        return {}
+    stamp = _git_stamp()
+    if _GIT is not None and _GIT[0] == stamp:
+        return _GIT[1]
+    info: dict[str, dict] = {}
+    at = by = ident = ""
+    for line in _git_log().split("\n"):
+        if line.startswith("\x01"):
+            _, at, by, ident = line.split("\x01")
+        elif line.strip() and line not in info:
+            # newest first, so the first mention of a path is the latest one
+            info[line] = {"at": float(at or 0), "by": by, "id": ident}
+    _GIT = (stamp, info)
+    return info
+
+
+def _last_change(rel: str, path: Path, git: dict[str, dict]) -> tuple[float, str]:
+    """(when, who) for one doc — git's answer, or the filesystem's."""
+    hit = git.get(rel)
+    if hit:
+        return hit["at"], hit["by"]
+    try:
+        return path.stat().st_mtime, ""
+    except OSError:
+        return 0.0, ""
+
+
+def doc_git(rel: str, path: Path) -> dict:
+    """What the reader shows under the breadcrumb of an open document."""
+    git = git_info()
+    at, by = _last_change(rel, path, git)
+    return {"at": at, "by": by, "id": (git.get(rel) or {}).get("id", "")}
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +728,9 @@ OLI_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
 TASK_RE = re.compile(r"^\[([ xX~✔✓])\]\s*(.*)$")
 TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:-]*-{2,}[\s:|-]*\|?\s*$")
 HTML_LINE_RE = re.compile(r"^\s*</?([A-Za-z][\w-]*)")
+# Link targets that name somewhere other than this repo. Shared with the
+# backlink index, which has to skip exactly the same ones.
+EXTERNAL_RE = re.compile(r"^(https?:|mailto:|vscode:|data:|//)")
 INLINE_HTML_OK = ("br", "kbd", "sub", "sup", "b", "i", "em", "strong", "small", "u", "mark")
 BLOCK_HTML_OK = {
     "details", "summary", "div", "img", "picture", "source", "table", "thead", "tbody",
@@ -612,7 +763,7 @@ class Markdown:
         href = href.strip()
         if not href:
             return "#", "x"
-        if re.match(r"^(https?:|mailto:|vscode:|data:|//)", href):
+        if EXTERNAL_RE.match(href):
             return _esc(href, True), "ext"
         if href.startswith("#"):
             return _esc(href, True), "anchor"
@@ -621,8 +772,7 @@ class Markdown:
             href, anchor = href.split("#", 1)
             if not href:
                 return _esc("#" + anchor, True), "anchor"
-        target = (self.dir / href) if not href.startswith("/") else PurePosixPath(href.lstrip("/"))
-        rel = PurePosixPath(*_normalize(target.parts)).as_posix()
+        rel = _rel_target(self.dir, href)
         abs_path = ROOT / rel
         if not abs_path.exists():
             return _esc(f"#/{rel}", True), "miss"
@@ -639,9 +789,7 @@ class Markdown:
         src = src.strip()
         if re.match(r"^(https?:|data:|//)", src):
             return _esc(src, True)
-        target = (self.dir / src) if not src.startswith("/") else PurePosixPath(src.lstrip("/"))
-        rel = PurePosixPath(*_normalize(target.parts)).as_posix()
-        return _esc(f"/raw?p={rel}", True)
+        return _esc(f"/raw?p={_rel_target(self.dir, src)}", True)
 
     # -- inline ------------------------------------------------------------ #
 
@@ -995,6 +1143,17 @@ def _normalize(parts: tuple[str, ...]) -> list[str]:
     return stack
 
 
+def _rel_target(base: PurePosixPath, href: str) -> str:
+    """Where a link written inside a doc in `base` points, repo-relative.
+
+    Shared, because the renderer and the backlink index have to agree on it —
+    two spellings of the same arithmetic is how a doc ends up linked from a
+    page whose link it does not contain.
+    """
+    target = (base / href) if not href.startswith("/") else PurePosixPath(href.lstrip("/"))
+    return PurePosixPath(*_normalize(target.parts)).as_posix()
+
+
 def _split_row(line: str) -> list[str]:
     """Split a table row on `|`, respecting code spans and escapes."""
     s = line.strip()
@@ -1043,37 +1202,163 @@ def _as_written(text: str) -> str:
     return text
 
 
+def _no_meta(path: Path) -> dict:
+    """Metadata default: the format carries none."""
+    return {}
+
+
+# Images are excluded: a doc is not "linked from" the page that displays its logo.
+MD_LINK_RE = re.compile(r"(?<!!)\[(?:[^\[\]]|\[[^\]]*\])*\]\(([^)\s]+)")
+
+
+def _md_links(text: str) -> list[str]:
+    """Every link target a doc writes, in markdown's spelling."""
+    return MD_LINK_RE.findall(text)
+
+
 @dataclass
 class Format:
-    """One document format: how to name it, render it, and search it."""
+    """One document format: how to name it, render it, search it, and link it."""
 
     suffixes: tuple[str, ...]
-    render: Callable[[str, str], dict]  # (doc rel path, text) → html/toc/mermaid/title
+    render: Callable[[str, str], dict]  # (doc rel path, text) → html/toc/mermaid/title/meta
     title: Callable[[Path], str]  # a cheap title for the sidebar, never a full parse
     text: Callable[[str], str] = _as_written  # what search greps, when the file isn't it
     max_bytes: int = 0  # 0 = no ceiling
+    meta: Callable[[Path], dict] = _no_meta  # front matter, for formats that have it
+    links: Callable[[str], list[str]] = _md_links  # link targets, read from `text`
+
+
+# -- front matter ----------------------------------------------------------- #
+#
+# Deliberately not YAML — there is no YAML in the standard library, and the
+# subset repo docs actually write is `key: value`, one per line. Lists come as
+# `[a, b]` or as `- a` on the lines below. Anything else is skipped rather than
+# guessed at, which is the same bargain the markdown parser makes.
+
+FRONT_MAX_LINES = 100  # a block longer than this is prose that opens with a rule
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _front_scalar(value: str) -> object:
+    """A front matter value. `#` is left alone — `title: C# notes` is a title."""
+    if value.startswith("[") and value.endswith("]"):
+        return [_unquote(x.strip()) for x in value[1:-1].split(",") if x.strip()]
+    return _unquote(value)
+
+
+def _front_parse(lines: list[str]) -> dict:
+    meta: dict = {}
+    i, n = 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        i += 1
+        # Indented lines belong to whatever came before; a bare `#` is a comment.
+        if not raw.strip() or raw.lstrip().startswith("#") or raw[:1].isspace():
+            continue
+        key, sep, value = raw.partition(":")
+        if not sep or not key.strip():
+            continue
+        key, value = key.strip().lower(), value.strip()
+        if value:
+            meta[key] = _front_scalar(value)
+            continue
+        items = []
+        while i < n and lines[i].lstrip().startswith("- "):
+            items.append(_unquote(lines[i].lstrip()[2:].strip()))
+            i += 1
+        meta[key] = [x for x in items if x]
+    return meta
+
+
+def _front_matter(text: str) -> tuple[dict, str]:
+    """Split a leading `---` block off a document → (metadata, the rest).
+
+    A block that never closes is treated as no block at all: swallowing the
+    whole document because someone opened with a horizontal rule is a far worse
+    failure than ignoring front matter nobody wrote.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines[0].strip() != "---":
+        return {}, text
+    for i in range(1, min(len(lines), FRONT_MAX_LINES + 1)):
+        if lines[i].strip() in ("---", "..."):
+            return _front_parse(lines[1:i]), "\n".join(lines[i + 1 :])
+    return {}, text
+
+
+def meta_str(meta: dict, key: str) -> str:
+    value = meta.get(key)
+    return str(value).strip() if isinstance(value, (str, int, float)) else ""
+
+
+def meta_list(meta: dict, key: str) -> list[str]:
+    value = meta.get(key)
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    # `tags: a, b` is written often enough to be worth reading.
+    return [x.strip() for x in meta_str(meta, key).split(",") if x.strip()]
+
+
+def meta_bool(meta: dict, key: str) -> bool:
+    return meta_str(meta, key).lower() in ("true", "yes", "1", "on")
+
+
+def meta_int(meta: dict, key: str) -> int | None:
+    try:
+        return int(float(meta_str(meta, key)))
+    except ValueError:
+        return None
 
 
 def _render_markdown(rel: str, text: str) -> dict:
+    meta, body = _front_matter(text)
     md = Markdown(rel)
-    html = md.render(text)
-    return {"html": html, "toc": md.toc, "mermaid": md.mermaid, "title": md.title}
+    html = md.render(body)
+    return {
+        "html": html,
+        "toc": md.toc,
+        "mermaid": md.mermaid,
+        "title": meta_str(meta, "title") or md.title,
+        "meta": meta,
+    }
+
+
+# Enough lines to clear a front matter block and still reach a `# Title` under it.
+TITLE_SCAN_LINES = 160
+
+
+def _md_head(path: Path) -> tuple[dict, str]:
+    """(front matter, the body under it) from a bounded prefix of the file."""
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        head = "".join(fh.readline() for _ in range(TITLE_SCAN_LINES))
+    return _front_matter(head)
+
+
+def _md_meta(path: Path) -> dict:
+    return _md_head(path)[0]
 
 
 def _md_title(path: Path) -> str:
-    """A markdown doc's own `# Title`, if it has one near the top."""
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        in_fence = False
-        for _ in range(60):
-            line = fh.readline()
-            if not line:
-                break
-            s = line.strip()
-            if s.startswith("```"):
-                in_fence = not in_fence
-                continue
-            if not in_fence and s.startswith("# "):
-                return _plain(s[2:].strip())
+    """A markdown doc's title: front matter's if it declares one, else its `# Title`."""
+    meta, body = _md_head(path)
+    if title := meta_str(meta, "title"):
+        return title
+    in_fence = False
+    for line in body.split("\n"):
+        s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and s.startswith("# "):
+            return _plain(s[2:].strip())
     return ""
 
 
@@ -1221,6 +1506,11 @@ def _org_title(path: Path) -> str:
             if m and not heading:
                 heading = _plain(_org_inline(ORG_TAGS_RE.sub("", m.group(2).strip())))
     return heading
+
+
+def _org_links(text: str) -> list[str]:
+    """Org spells its links `[[target][label]]`, so the markdown scan misses them."""
+    return [_org_href(m.group(1)) for m in ORG_LINK_RE.finditer(text)]
 
 
 # -- jupyter notebooks ------------------------------------------------------ #
@@ -1375,11 +1665,15 @@ def _ipynb_title(path: Path) -> str:
     return title
 
 
-MARKDOWN = Format((".md", ".markdown", ".mdown", ".mkd"), _render_markdown, _md_title)
+MARKDOWN = Format(
+    (".md", ".markdown", ".mdown", ".mkd"), _render_markdown, _md_title, meta=_md_meta
+)
 
 FORMATS = (
     MARKDOWN,
-    Format((".org",), _render_org, _org_title),
+    Format((".org",), _render_org, _org_title, links=_org_links),
+    # A notebook's links live in its markdown cells, which is exactly what
+    # `_nb_search_text` hands over — so the default markdown scan reads them.
     Format((".ipynb",), _render_notebook, _ipynb_title, _nb_search_text, NB_MAX_BYTES),
 )
 
@@ -1441,6 +1735,7 @@ def render_doc(rel: str) -> dict:
         if fmt.max_bytes and stat.st_size > fmt.max_bytes:
             return {"error": f"{rel} is too large to display ({stat.st_size // 1024} KB)"}
         out = fmt.render(rel, path.read_text(encoding="utf-8", errors="replace"))
+        meta = out.get("meta") or {}
         return {
             "path": rel,
             "abs": str(path),
@@ -1451,6 +1746,10 @@ def render_doc(rel: str) -> dict:
             "mtime": stat.st_mtime,
             "kind": _kind_of(path),
             "source": False,
+            "tags": meta_list(meta, "tags"),
+            "draft": meta_bool(meta, "draft"),
+            "git": doc_git(rel, path),
+            "backlinks": backlinks(rel),
         }
     if stat.st_size > 2_000_000:
         return {"error": f"{rel} is too large to display ({stat.st_size // 1024} KB)"}
@@ -1467,6 +1766,41 @@ def render_doc(rel: str) -> dict:
         "kind": "source",
         "source": True,
         "lines": text.count("\n") + 1,
+        "tags": [],
+        "draft": False,
+        "git": doc_git(rel, path),
+        "backlinks": backlinks(rel),
+    }
+
+
+def tree_payload() -> dict:
+    """`/api/tree`'s body. Shared with the exporter, which bakes it into the
+    page — one shape, so the reader cannot tell a bundle from a server."""
+    return {
+        "groups": [
+            {
+                "id": g.gid,
+                "title": g.title,
+                "num": g.num,
+                "state": g.state,
+                "prefix": g.prefix,
+                "docs": [
+                    {
+                        "path": d.rel,
+                        "title": d.title,
+                        "label": d.label,
+                        "kind": d.kind,
+                        "tags": d.tags,
+                        "draft": d.draft,
+                        "updated": d.updated,
+                        "by": d.by,
+                    }
+                    for d in g.docs
+                ],
+            }
+            for g in build_tree()
+        ],
+        "version": version_stamp(),
     }
 
 
@@ -1527,6 +1861,208 @@ def version_stamp() -> str:
     return f"{count}:{acc:.0f}"
 
 
+# -- the link graph --------------------------------------------------------- #
+
+
+@dataclass
+class LinkIndex:
+    """Both directions of the repo's links, built in one pass over the docs."""
+
+    into: dict[str, list[dict]] = field(default_factory=dict)  # target → docs pointing at it
+    out: dict[str, list[str]] = field(default_factory=dict)  # doc → what it points at
+
+
+BACKLINK_LIMIT = 24  # a doc linked from everywhere wants a footer, not a directory
+
+_INDEX: tuple[str, LinkIndex] | None = None
+
+
+def _link_rel(base: PurePosixPath, href: str) -> str:
+    """A link target as a repo-relative path, or "" when it doesn't name one."""
+    href = href.strip()
+    if not href or href.startswith("#") or EXTERNAL_RE.match(href):
+        return ""
+    href = href.split("#", 1)[0]
+    return _rel_target(base, href) if href else ""
+
+
+def link_index() -> LinkIndex:
+    """Who links to what across every document.
+
+    Each doc is scanned with its own format's link reader, so an org
+    `[[file:…]]` and a markdown `[…](…)` land in the same graph. Cached against
+    the same mtime fingerprint the live reload polls, which invalidates it on
+    an edit and at no other time.
+    """
+    global _INDEX
+    stamp = version_stamp()
+    if _INDEX is not None and _INDEX[0] == stamp:
+        return _INDEX[1]
+
+    index = LinkIndex()
+    for g in build_tree():
+        for doc in g.docs:
+            path = ROOT / doc.rel
+            fmt = DOC_SUFFIXES.get(path.suffix.lower())
+            if fmt is None:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            base = PurePosixPath(doc.rel).parent
+            targets: list[str] = []
+            for href in fmt.links(fmt.text(raw)):
+                target = _link_rel(base, href)
+                # A doc linking to its own headings is not linking to itself.
+                if target and target != doc.rel and target not in targets:
+                    targets.append(target)
+            index.out[doc.rel] = targets
+            for target in targets:
+                index.into.setdefault(target, []).append({"path": doc.rel, "title": doc.title})
+    _INDEX = (stamp, index)
+    return index
+
+
+def backlinks(rel: str) -> list[dict]:
+    """The docs that link to `rel`. Works for source files too — that a spec
+    points at `router.rs` is worth knowing from `router.rs`."""
+    return sorted(link_index().into.get(rel, []), key=lambda d: d["path"])[:BACKLINK_LIMIT]
+
+
+# --------------------------------------------------------------------------- #
+# Export — every doc in the repo as one self-contained HTML file. The same
+# page and the same renderer; the only difference is that the reader finds its
+# data baked into `TOME.bundle` rather than behind `/api/…`. So an export can
+# be mailed, attached to a release, or opened off a stick with no Python on it.
+# --------------------------------------------------------------------------- #
+
+EXPORT_IMG_MAX = 2_000_000  # per image — past this it is a download, not an illustration
+EXPORT_SRC_MAX = 200_000  # per linked source file
+RAW_URL_RE = re.compile(r'(src|href)="/raw\?p=([^"]*)"')
+
+
+def _data_uri(rel: str) -> str:
+    """An image as a `data:` URI, or "" if it isn't one we can embed."""
+    path = safe_path(rel)
+    if path is None or path.suffix.lower() not in RAW_SUFFIXES:
+        return ""
+    try:
+        if path.stat().st_size > EXPORT_IMG_MAX:
+            return ""
+        blob = path.read_bytes()
+    except OSError:
+        return ""
+    mime = MIME.get(path.suffix.lower(), "application/octet-stream")
+    return f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"
+
+
+def _doc_text(rel: str) -> str:
+    """What the bundled search greps — the same text `search()` reads, so the
+    export's ⌘K finds precisely what the server's would."""
+    path = ROOT / rel
+    fmt = DOC_SUFFIXES.get(path.suffix.lower())
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return fmt.text(raw) if fmt is not None else raw
+
+
+def _linked_sources(docs: dict[str, dict]) -> list[str]:
+    """The source files the docs actually link to.
+
+    tome's headline is that `[router.rs](../src/router.rs)` opens the real
+    file; an export that dropped those would break its own demo on the first
+    click. Only what something links to, only what is small, and — through
+    `safe_path` — never a secret.
+    """
+    found: list[str] = []
+    for targets in link_index().out.values():
+        for rel in targets:
+            if rel in docs or rel in found:
+                continue
+            path = safe_path(rel)
+            if path is None or path.suffix.lower() in RAW_SUFFIXES:
+                continue
+            try:
+                if path.stat().st_size > EXPORT_SRC_MAX:
+                    continue
+            except OSError:
+                continue
+            found.append(rel)
+    return sorted(found)
+
+
+def _bundle() -> tuple[dict, dict]:
+    """(everything the page needs, what to tell the user we put in it)."""
+    tree = tree_payload()
+    docs: dict[str, dict] = {}
+    stats = {"docs": 0, "sources": 0, "images": 0, "skipped": 0}
+    assets: dict[str, str] = {}  # rel → data URI, so a shared logo is embedded once
+
+    def inline(m: re.Match) -> str:
+        attr, rel = m.group(1), html_mod.unescape(m.group(2))
+        if rel not in assets:
+            assets[rel] = _data_uri(rel)
+            stats["images" if assets[rel] else "skipped"] += 1
+        # What we can't embed keeps its own path, which still resolves if the
+        # export is opened from inside the repo it came from.
+        return f'{attr}="{_esc(assets[rel] or rel, True)}"'
+
+    def add(rel: str) -> bool:
+        doc = render_doc(rel)
+        if doc.get("error"):
+            return False
+        doc["html"] = RAW_URL_RE.sub(inline, doc["html"])
+        # The absolute path is only ever used to open an editor, which an
+        # export cannot do — and it carries the exporter's home directory.
+        doc.pop("abs", None)
+        docs[rel] = doc
+        return True
+
+    for group in tree["groups"]:
+        for entry in group["docs"]:
+            if add(entry["path"]):
+                docs[entry["path"]]["text"] = _doc_text(entry["path"])
+                stats["docs"] += 1
+
+    # Source files carry no `text`: the server doesn't search them either, and
+    # a highlighted 200 KB file is quite large enough once.
+    for rel in _linked_sources(docs):
+        if add(rel):
+            stats["sources"] += 1
+
+    return {"groups": tree["groups"], "version": tree["version"], "docs": docs}, stats
+
+
+def export(dest: Path) -> int:
+    bundle, stats = _bundle()
+    if not stats["docs"]:
+        say(f"error: nothing to export from {ROOT}", err=True)
+        return 1
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(page_html(bundle), encoding="utf-8")
+    except OSError as e:
+        say(f"error: cannot write {dest} — {e}", err=True)
+        return 1
+    say(f"✅ wrote {dest} ({dest.stat().st_size / 1_000_000:.1f} MB)")
+    say(
+        f"  {stats['docs']} doc{'s' * (stats['docs'] != 1)}"
+        f" · {stats['sources']} linked source file{'s' * (stats['sources'] != 1)}"
+        f" · {stats['images']} image{'s' * (stats['images'] != 1)} inlined"
+        " · opens with no server"
+    )
+    if stats["skipped"]:
+        say(
+            f"warning: {stats['skipped']} image{'s' * (stats['skipped'] != 1)} kept as a"
+            f" relative path — missing, or over {EXPORT_IMG_MAX // 1_000_000} MB",
+            err=True,
+        )
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Server
 # --------------------------------------------------------------------------- #
@@ -1562,25 +2098,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/tree":
-            self._json(
-                {
-                    "groups": [
-                        {
-                            "id": g.gid,
-                            "title": g.title,
-                            "num": g.num,
-                            "state": g.state,
-                            "prefix": g.prefix,
-                            "docs": [
-                                {"path": d.rel, "title": d.title, "label": d.label, "kind": d.kind}
-                                for d in g.docs
-                            ],
-                        }
-                        for g in build_tree()
-                    ],
-                    "version": version_stamp(),
-                }
-            )
+            self._json(tree_payload())
             return
 
         if route == "/api/doc":
@@ -1682,6 +2200,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--port", type=int, default=int(os.environ.get("TOME_PORT") or 7979),
                     help="preferred port; advances if taken (default: 7979)")
     ap.add_argument("--open", action="store_true", help="launch a browser tab")
+    ap.add_argument("--export", metavar="FILE",
+                    help="write every doc to one self-contained HTML file and exit")
     ap.add_argument("--init-config", action="store_true",
                     help=f"write a starter {CONFIG_NAME} and exit")
     ap.add_argument("--version", action="version", version=f"tome {__version__}")
@@ -1711,6 +2231,9 @@ def main(argv: list[str]) -> int:
     if not total:
         print(f"no markdown found under {root}", file=sys.stderr)
         return 1
+
+    if args.export:
+        return export(Path(args.export).expanduser())
 
     bound = _bind(args.port)
     if bound is None:
@@ -1757,27 +2280,38 @@ FAVICON = (
 )
 
 
-def page_html() -> str:
-    """The page with this repo's name, brand, icon, and settings baked in."""
+def page_html(bundle: dict | None = None) -> str:
+    """The page with this repo's name, brand, icon, and settings baked in.
+
+    Given a bundle, the same page with every document baked in too — the
+    reader reads `TOME.bundle` instead of calling the server, and that is the
+    whole of the difference between what tome serves and what it exports.
+    """
     name = CFG.name
     head, dash, tail = name.partition("-")
-    settings = json.dumps(
-        {
-            "name": name,
-            "theme": CFG.theme or "mocha",
-            "home": CFG.home or _primary_doc(ROOT),
-            "editorUrl": CFG.editor_url,
-            # Per-repo localStorage namespace, so "last doc I read" and which
-            # sections are expanded don't leak between repos sharing a port.
-            "repo": str(ROOT),
-            "version": __version__,
-        }
-    ).replace("<", "\\u003c")  # so a "</script>" in a path cannot close the tag
+    settings: dict[str, object] = {
+        "name": name,
+        "theme": CFG.theme or "mocha",
+        "home": CFG.home or _primary_doc(ROOT),
+        # An export has no server to reach and no local editor to open.
+        "editorUrl": "" if bundle else CFG.editor_url,
+        # Per-repo localStorage namespace, so "last doc I read" and which
+        # sections are expanded don't leak between repos sharing a port. An
+        # export is passed around, so it keys on the name, not on a path that
+        # would carry the exporter's home directory to whoever opens it.
+        "repo": name if bundle else str(ROOT),
+        "version": __version__,
+    }
+    if bundle:
+        settings["bundle"] = bundle
+    # Every "<" in here sits inside a JSON string, so escaping them all is both
+    # safe and enough — no path, and no exported document, can close the tag.
+    settings_json = json.dumps(settings).replace("<", "\\u003c")
     return (
         PAGE.replace("{{TITLE}}", _esc(name))
         .replace("{{BRAND}}", f'{_esc(head)}<span class="g">{_esc(dash + tail)}</span>')
         .replace("{{FAVICON}}", FAVICON.format(icon=_esc(CFG.icon, True)))
-        .replace("{{SETTINGS}}", settings)
+        .replace("{{SETTINGS}}", settings_json)
     )
 
 
@@ -1982,6 +2516,8 @@ PAGE = r"""<!doctype html>
   a.item.on .k{color:var(--blue)}
   a.item.kSPEC .k{color:var(--peach)} a.item.kCONCEPTS .k{color:var(--mauve)}
   a.item.kRESEARCH .k{color:var(--teal)}
+  /* `draft: true` in the front matter — still listed, visibly not finished. */
+  a.item.isdraft{opacity:.6} a.item.isdraft:hover{opacity:1}
 
   /* ── main ─────────────────────────────────────────────────────────────── */
   main{min-width:0;display:flex;flex-direction:column}
@@ -2121,8 +2657,33 @@ PAGE = r"""<!doctype html>
   .toc a.l3{padding-left:22px;font-size:12px;color:var(--dim)}
   .toc a.l3:hover,.toc a.l3.on{color:var(--blue)}
 
+  /* ── document meta ────────────────────────────────────────────────────── */
+  .dmeta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 20px;
+    font-size:11.5px;color:var(--dim)}
+  .dmeta .mi{display:inline-flex;align-items:center;gap:5px}
+  .dmeta .mi + .mi::before{content:"·";color:var(--line2);margin-right:5px}
+  .dmeta .mono{font-family:var(--mono)}
+  .chip{border:1px solid var(--line);border-radius:999px;padding:2px 9px;
+    font:11px var(--sans);color:var(--sub);background:var(--panel)}
+  button.chip{cursor:pointer}
+  button.chip:hover{border-color:var(--blue);color:var(--blue)}
+  .chip.tag::before{content:"#";color:var(--dim);margin-right:1px}
+  .chip.draft{color:var(--yellow);border-color:color-mix(in srgb, var(--yellow) 40%, transparent)}
+
+  /* ── backlinks ────────────────────────────────────────────────────────── */
+  .bl{margin-top:52px;padding-top:20px;border-top:1px solid var(--line)}
+  .bl .blh{font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);
+    margin-bottom:9px}
+  .bl a{display:flex;gap:12px;align-items:baseline;padding:6px 10px;border-radius:8px;
+    text-decoration:none;color:var(--text);font-size:13.5px}
+  .bl a:hover{background:var(--panel)}
+  .bl a .p{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
   /* ── prev / next ──────────────────────────────────────────────────────── */
   .pn{display:flex;gap:14px;margin-top:56px;padding-top:22px;border-top:1px solid var(--line)}
+  /* Two stacked rules under one document is one border too many. */
+  .bl + .pn{margin-top:26px}
   .pn a{flex:1;padding:13px 16px;border:1px solid var(--line);border-radius:11px;
     text-decoration:none;color:var(--text);border-bottom-width:1px}
   .pn a:hover{border-color:var(--line2);background:var(--panel)}
@@ -2345,9 +2906,26 @@ function toggleZen(){
   applyChrome();
 }
 
-/* ── data ───────────────────────────────────────────────────────────────── */
+/* ── data ─────────────────────────────────────────────────────────────────
+   A served page asks the server for its payloads; an export carries the very
+   same ones inside TOME.bundle. These three are the only place that knows
+   which it is — everything below reads one shape either way.              */
+const BUNDLE = TOME.bundle || null;
+
+const getTree = () => BUNDLE
+  ? Promise.resolve({groups: BUNDLE.groups, version: BUNDLE.version})
+  : fetch("/api/tree").then(r => r.json());
+
+const getDoc = (path) => BUNDLE
+  ? Promise.resolve(BUNDLE.docs[path] || {error: "not included in this export: " + path})
+  : fetch("/api/doc?p=" + encodeURIComponent(path)).then(r => r.json());
+
+const getSearch = (q) => BUNDLE
+  ? Promise.resolve({results: localSearch(q)})
+  : fetch("/api/search?q=" + encodeURIComponent(q)).then(r => r.json());
+
 async function loadTree(){
-  const r = await fetch("/api/tree").then(r => r.json());
+  const r = await getTree();
   TREE = r.groups; VERSION = r.version;
   FLAT = [];
   for (const g of TREE) for (const d of g.docs) FLAT.push({...d, group: g.title, gid: g.id});
@@ -2361,9 +2939,7 @@ function renderNav(){
   nav.innerHTML = "";
   const saved = JSON.parse(localStorage.getItem(RK("open")) || "{}");
   for (const g of TREE){
-    const docs = filter
-      ? g.docs.filter(d => (d.title + " " + d.path + " " + d.label).toLowerCase().includes(filter))
-      : g.docs;
+    const docs = filter ? g.docs.filter(d => matches(d, filter)) : g.docs;
     if (!docs.length) continue;
     const isOpen = filter ? true : (saved[g.id] ?? defaultOpen(g));
     const div = document.createElement("div");
@@ -2375,7 +2951,8 @@ function renderNav(){
       (g.state ? `<span class="st ${esc(g.state)}" title="${esc(g.state)}"></span>` : "") +
       `</div><div class="gitems">` +
       docs.map(d =>
-        `<a class="item k${d.kind}${d.path === CUR ? " on" : ""}" href="#/${d.path}">` +
+        `<a class="item k${d.kind}${d.path === CUR ? " on" : ""}${d.draft ? " isdraft" : ""}" ` +
+        `href="#/${d.path}">` +
         `<span class="k">${d.kind === "doc" ? "·" : d.kind[0]}</span>` +
         `<span>${esc(d.label)}</span></a>`).join("") +
       `</div>`;
@@ -2396,6 +2973,11 @@ const defaultOpen = (g) =>
   Boolean(g.prefix && CUR && CUR.startsWith(g.prefix)) || g.id === "root";
 const ESCAPES = {"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;"};
 const esc = (s) => (s || "").replace(/[&<>"]/g, (c) => ESCAPES[c]);
+/* Names match loosely, tags exactly: clicking the tag "api" should not also
+   pull in every doc whose path happens to contain those three letters. */
+const matches = (d, q) =>
+  (d.title + " " + d.path + " " + d.label).toLowerCase().includes(q) ||
+  (d.tags || []).some(t => t.toLowerCase() === q);
 
 /* ── routing ────────────────────────────────────────────────────────────── */
 function route(){
@@ -2411,7 +2993,7 @@ function route(){
 
 async function openDoc(path, anchor, keepScroll){
   const scroll = keepScroll ? window.scrollY : 0;
-  const d = await fetch("/api/doc?p=" + encodeURIComponent(path)).then(r => r.json());
+  const d = await getDoc(path);
   if (d.error){
     $("#doc").innerHTML = `<div class="empty">${esc(d.error)}</div>`;
     $("#crumb").textContent = path;
@@ -2420,16 +3002,17 @@ async function openDoc(path, anchor, keepScroll){
   }
   CUR = d.path;
   localStorage.setItem(RK("last"), d.path);
-  document.title = d.title + " · gauntlet docs";
+  document.title = d.title + " · " + TOME.name;
   const parts = d.path.split("/");
   $("#crumb").innerHTML = parts.map((p, i) =>
     i === parts.length - 1 ? `<b>${esc(p)}</b>` : esc(p)).join(" / ");
   const ed = $("#editBtn");
   ed.href = TOME.editorUrl ? TOME.editorUrl.replace("{path}", d.abs) : "#";
   ed.style.display = TOME.editorUrl ? "" : "none";
-  $("#doc").innerHTML = d.html + prevNext(d.path);
+  $("#doc").innerHTML = docMeta(d) + d.html + backlinks(d) + prevNext(d.path);
   buildToc(d.toc);
   wireCode();
+  wireMeta();
   if (d.mermaid) loadMermaid();
   renderNav();
   document.querySelector(".item.on")?.scrollIntoView({block:"nearest"});
@@ -2459,6 +3042,51 @@ function scrollToText(q){
     setTimeout(() => mark.classList.remove("flash"), 2200);
     return;
   }
+}
+
+/* ── document furniture ───────────────────────────────────────────────────
+   What a doc knows about itself beyond its prose: when it last changed, who
+   changed it, what it declared in its front matter, and who links to it. */
+const SPANS = [[31536000,"y"], [2592000,"mo"], [604800,"w"], [86400,"d"], [3600,"h"], [60,"m"]];
+function ago(ts){
+  if (!ts) return "";
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return "just now";
+  for (const [span, unit] of SPANS) if (s >= span) return Math.floor(s / span) + unit + " ago";
+  return "";
+}
+
+function docMeta(d){
+  const git = d.git || {};
+  const bits = [];
+  const when = ago(git.at);
+  if (when){
+    const exact = new Date(git.at * 1000).toLocaleString();
+    bits.push(`<span class="mi" title="${esc(exact)}">${esc(when)}</span>`);
+  }
+  if (git.by) bits.push(`<span class="mi">${esc(git.by)}</span>`);
+  if (git.id) bits.push(`<span class="mi mono">${esc(git.id)}</span>`);
+  if (d.draft) bits.push('<span class="chip draft">draft</span>');
+  for (const t of d.tags || [])
+    bits.push(`<button class="chip tag" data-tag="${esc(t)}">${esc(t)}</button>`);
+  return bits.length ? `<div class="dmeta">${bits.join("")}</div>` : "";
+}
+
+/* A tag is a filter you can see: clicking one narrows the sidebar to it. */
+function wireMeta(){
+  document.querySelectorAll(".chip.tag").forEach(b => b.onclick = () => {
+    $("#filter").value = b.dataset.tag;
+    if (HIDE_NAV) toggleNav();
+    renderNav();
+  });
+}
+
+function backlinks(d){
+  const bl = d.backlinks || [];
+  if (!bl.length) return "";
+  return '<div class="bl"><div class="blh">linked from</div>' + bl.map(b =>
+    `<a href="#/${esc(b.path)}">${esc(b.title || b.path)}` +
+    `<span class="p">${esc(b.path)}</span></a>`).join("") + "</div>";
 }
 
 function prevNext(path){
@@ -2539,7 +3167,45 @@ function loadMermaid(){
   document.head.appendChild(s);
 }
 
-/* ── command palette ────────────────────────────────────────────────────── */
+/* ── command palette ──────────────────────────────────────────────────────
+   Fuzzy matching over titles and paths happens here in both modes; the
+   full-text sweep is the server's job, unless there is no server.        */
+
+/* The server's `search()`, in the browser: the same brute-force pass over the
+   same text the server would have read, so an export's ⌘K finds what the
+   served page finds — including the line numbers it reports.            */
+function localSearch(q){
+  const needle = q.trim().toLowerCase();
+  if (needle.length < 2) return [];
+  const out = [];
+  for (const g of BUNDLE.groups){
+    for (const entry of g.docs){
+      const doc = BUNDLE.docs[entry.path];
+      if (!doc || !doc.text || !doc.text.toLowerCase().includes(needle)) continue;
+      const lines = doc.text.split("\n");
+      const mine = [];
+      let hits = 0;
+      for (let i = 0; i < lines.length; i++){
+        if (!lines[i].toLowerCase().includes(needle)) continue;
+        hits++;
+        if (hits > 3) continue;
+        let sn = lines[i].trim();
+        if (sn.length > 190){
+          const at = sn.toLowerCase().indexOf(needle);
+          sn = "…" + sn.slice(Math.max(0, at - 70), at + 120) + "…";
+        }
+        mine.push({path: entry.path, title: entry.title, group: g.title,
+                   line: i + 1, snippet: sn, count: 0});
+      }
+      for (const r of mine) r.count = hits;
+      out.push(...mine);
+    }
+  }
+  out.sort((a, b) =>
+    b.count - a.count || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0) || a.line - b.line);
+  return out.slice(0, 60);
+}
+
 function fuzzy(q, s){
   q = q.toLowerCase(); s = s.toLowerCase();
   let qi = 0, score = 0, streak = 0;
@@ -2573,7 +3239,7 @@ function paletteRender(q){
   if (q.length >= 3){
     clearTimeout(searchT);
     searchT = setTimeout(async () => {
-      const r = await fetch("/api/search?q=" + encodeURIComponent(q)).then(r => r.json());
+      const r = await getSearch(q);
       if ($("#q").value.trim() !== q) return;
       const hits = r.results.map(x => ({...x, _hit: true}));
       RESULTS = RESULTS.concat(hits);
@@ -2669,8 +3335,9 @@ document.addEventListener("keydown", (e) => {
 
 window.addEventListener("hashchange", route);
 
-/* live reload — repoll mtimes; re-render the open doc in place when it changes */
-setInterval(async () => {
+/* live reload — repoll mtimes; re-render the open doc in place when it changes.
+   An export has no server to poll and nothing behind it that can change. */
+if (!BUNDLE) setInterval(async () => {
   try{
     const r = await fetch("/api/version").then(r => r.json());
     if (r.version !== VERSION){
