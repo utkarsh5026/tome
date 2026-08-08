@@ -1,13 +1,22 @@
 name: publish
 
-# Fires on version tags (v0.1.0, v0.2.3, ...). Uses PyPI's trusted publishing
-# (OIDC) — no API token stored in this repo. The trusted publisher has to be
-# configured on the PyPI project side first: pypi.org -> tome-docs -> Publishing
-# -> add GitHub publisher for utkarsh5026/tome, workflow "publish.yml",
-# environment "pypi".
+# Fires on version tags (v0.1.0, v0.2.3, ...). Ships two things from one tag:
+# the wheel to PyPI, and standalone binaries to the GitHub Release.
+#
+# PyPI uses trusted publishing (OIDC) — no API token stored in this repo. The
+# trusted publisher has to be configured on the PyPI project side first:
+# pypi.org -> tome-docs -> Publishing -> add GitHub publisher for
+# utkarsh5026/tome, workflow "publish.yml", environment "pypi".
 on:
   push:
     tags: ["v*.*.*"]
+  # A broken release matrix otherwise surfaces at tag time, which is the worst
+  # moment to find it. These two let the binaries be built and smoke-tested
+  # without publishing anything — `publish` and `release` are tag-only below.
+  # The paths filter means ordinary PRs don't pay for five runners.
+  pull_request:
+    paths: [".github/workflows/publish.yml"]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,7 +28,9 @@ jobs:
           python-version: "3.13"
       # The tag is the source of truth for what's being published; catch a
       # forgotten version bump before it reaches PyPI instead of after.
+      # Nothing to compare against on a dry run, where the ref is a branch.
       - name: tag matches __version__ in tome.py
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           file_version=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('tome.py').read()).group(1))")
@@ -36,6 +47,7 @@ jobs:
 
   publish:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')   # never publish from a dry run
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -48,3 +60,123 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # For people who don't have Python at all. PyInstaller can't cross-compile,
+  # so each binary is built on the OS it targets — that's the whole reason this
+  # is a matrix rather than one job.
+  binaries:
+    needs: build          # don't burn five runners on a tag that failed the version check
+    strategy:
+      fail-fast: false    # the default cancels every sibling on one failure, throwing away four good binaries
+      matrix:
+        include:
+          # 22.04, not 24.04: the build host sets the glibc floor, and 2.35
+          # reaches a lot of machines that 2.39 does not.
+          # --strip is Linux-only — on macOS it can invalidate the ad-hoc
+          # signature, and it buys about 2.5MB where it does apply.
+          - { os: ubuntu-22.04,     asset: tome-linux-x86_64,       strip: "--strip" }
+          - { os: ubuntu-22.04-arm, asset: tome-linux-aarch64,      strip: "--strip" }
+          - { os: macos-13,         asset: tome-macos-x86_64,       strip: ""        }  # Intel
+          - { os: macos-14,         asset: tome-macos-arm64,        strip: ""        }  # Apple Silicon
+          - { os: windows-latest,   asset: tome-windows-x86_64.exe, strip: ""        }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash       # including on Windows, so one script covers all five
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pyinstaller
+
+      # The excludes are deliberately timid. http.server imports email to parse
+      # headers, so trimming "obviously unused" stdlib is how you ship a binary
+      # that imports fine and dies on the first request. --noupx because UPX
+      # compression is a reliable way to get flagged by Windows Defender.
+      - name: build
+        run: |
+          pyinstaller --onefile --noupx --console --name tome \
+            --exclude-module tkinter \
+            --exclude-module unittest \
+            --exclude-module sqlite3 \
+            --exclude-module lzma \
+            --exclude-module bz2 \
+            ${{ matrix.strip }} \
+            tome.py
+
+      # --version only proves the file starts; the imports that matter (email,
+      # via http.server) don't load until something is served. So serve this
+      # repo to itself and read a doc back out.
+      - name: it starts, and it serves
+        run: |
+          bin=dist/tome
+          if [ "$RUNNER_OS" = Windows ]; then bin=dist/tome.exe; fi
+          "$bin" --version
+
+          "$bin" --port 7979 > serve.log 2>&1 &
+          pid=$!
+
+          # _bind() walks forward to the next free port when one is taken, so
+          # asking for 7979 and curling 7979 can quietly test a different
+          # process. Take the URL tome itself printed.
+          url=""
+          for _ in $(seq 30); do
+            url=$(grep -o 'http://127\.0\.0\.1:[0-9]*' serve.log 2>/dev/null | head -1 || true)
+            if [ -n "$url" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$url" ]; then
+            echo "server never printed a URL:" >&2; cat serve.log >&2; exit 1
+          fi
+          echo "serving at $url"
+
+          curl -sf "$url/" | grep -q "<title>"
+          curl -sf "$url/api/tree" | grep -q '"groups"'
+          curl -sf "$url/api/doc?p=README.md" | grep -q '"html"'
+          kill "$pid" 2>/dev/null || true
+
+      - name: name it for the platform
+        run: |
+          mkdir -p out
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp dist/tome.exe "out/${{ matrix.asset }}"
+          else
+            cp dist/tome "out/${{ matrix.asset }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}   # v4 requires a unique name per job
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # Deliberately not `needs: publish` — until the PyPI pending publisher is
+  # registered, that job fails, and there's no reason for it to take the
+  # binaries down with it.
+  release:
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/')   # a dry run leaves the artifacts and stops
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tome-*
+          path: dist/
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum tome-* > SHA256SUMS
+      # The tag may or may not already have a release attached, depending on
+      # whether it was pushed from the CLI or cut in the UI. Handle both.
+      - name: attach binaries to the release
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+          fi

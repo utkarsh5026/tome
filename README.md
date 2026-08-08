@@ -97,6 +97,38 @@ chmod +x ~/.local/bin/tome
 
 Needs Python 3.9+. That's the entire dependency list.
 
+### No Python? Download a binary
+
+Every release also ships a standalone executable with the interpreter baked in —
+one file, nothing to install, no Python anywhere on the machine.
+
+**[Grab the latest release →](https://github.com/utkarsh5026/tome/releases/latest)**
+
+| platform | file |
+| --- | --- |
+| Linux · x86_64 | `tome-linux-x86_64` |
+| Linux · ARM64 | `tome-linux-aarch64` |
+| macOS · Intel | `tome-macos-x86_64` |
+| macOS · Apple Silicon | `tome-macos-arm64` |
+| Windows · x86_64 | `tome-windows-x86_64.exe` |
+
+```bash
+# macOS / Linux — make it executable and put it on PATH
+chmod +x tome-macos-arm64
+mv tome-macos-arm64 ~/.local/bin/tome
+```
+
+On Windows, double-clicking works too — it serves whatever folder it sits in.
+
+The binaries are unsigned, so the OS will say so the first time: on macOS,
+right-click → **Open** once (or `xattr -d com.apple.quarantine tome`); on
+Windows, SmartScreen's **More info → Run anyway**. A `SHA256SUMS` file is
+attached to every release if you'd rather verify the download.
+
+Worth knowing what you're trading: the binary is ~10 MB against the source's
+100 KB, because most of it is Python itself. If you already have an interpreter,
+the installs above are the better deal.
+
 ### Update
 
 Whichever way you installed it, updating uses the same tool — tome doesn't
