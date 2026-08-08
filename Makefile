@@ -1,4 +1,4 @@
-.PHONY: test lint run install site binary help
+.PHONY: test lint run install site binary page help
 
 help:
 	@echo "test     run the test suite"
@@ -7,6 +7,7 @@ help:
 	@echo "install  install the tome CLI from the working tree"
 	@echo "site     build + preview the GitHub Pages site on :8000"
 	@echo "binary   build a standalone executable for THIS platform into dist/"
+	@echo "page     inline web/app.css + web/app.js into tome.py (run after editing either)"
 
 test:
 	python3 -m unittest
@@ -28,6 +29,11 @@ site:
 # flags as that workflow, minus the --strip it adds on Linux (it's ~2.5MB, and
 # stripping is the one flag that isn't safe on every platform). The workflow is
 # the one that ships; keep these in step with it.
+# tome.py stays the one shipped file; only its PAGE constant is generated.
+# Edit web/app.css or web/app.js, run this, commit both.
+page:
+	python3 tools/build_page.py
+
 binary:
 	uvx --from pyinstaller pyinstaller --onefile --noupx --console --name tome \
 	  --exclude-module tkinter --exclude-module unittest --exclude-module sqlite3 \

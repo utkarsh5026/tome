@@ -1,7 +1,9 @@
 # CLAUDE.md — tome
 
 A local web reader for a repo's markdown. One Python file, no dependencies, no
-network, no build step. See `README.md` for the user-facing story.
+network. Nothing to build to *use* it — the only generated thing in the repo is
+the `PAGE` constant, inlined from `web/` by `make page`. See `README.md` for the
+user-facing story.
 
 ## ⚠️ The three constraints that define this project
 
@@ -13,7 +15,11 @@ Everything else is negotiable. These are not:
    feature — that is the whole reason `tome` installs in a second and runs on
    any machine with Python.
 2. **One file.** `tome.py` is the program: parser, highlighter, server, and page.
-   Someone can vendor it into a repo by copying it. Don't split it into a package.
+   Someone can vendor it into a repo by copying it, curl it into `~/.local/bin`,
+   or hand it to PyInstaller. Don't split it into a package. The frontend is the
+   one exception and it is not a real one — `web/app.css` and `web/app.js` are
+   editing conveniences that get inlined straight back into `tome.py`, which
+   remains the whole program.
 3. **Python 3.9+.** No `match`, no `tomllib` (hence JSON config), no `X | Y` at
    runtime — annotations are fine, the file has `from __future__ import annotations`.
    CI runs 3.9 and 3.13 on Linux, macOS, and Windows.
@@ -33,7 +39,7 @@ change that. It serves file contents out of someone's working tree.
 | **Markdown → HTML** | the `Markdown` class — one instance per rendered doc |
 | **Documents** | `safe_path`, `_is_secret`, `render_doc`, `search` |
 | **Server** | `Handler`, CLI parsing, `main`, `cli` |
-| **The page** | `page_html`, `FAVICON`, and `PAGE` — the whole inline HTML/CSS/JS |
+| **The page** | `page_html`, `FAVICON`, and `PAGE` — the inline HTML. **The CSS and the app JS inside `PAGE` are generated; edit `web/app.css` and `web/app.js`.** |
 
 `test_tome.py` is stdlib `unittest`, ~40 tests, most of which build a throwaway
 repo on disk with `make_repo({...})` and point tome at it. Add tests there; they
@@ -47,6 +53,8 @@ python3 -m unittest -v       # …with names
 uvx ruff check .             # lint — CI runs exactly this
 uv tool install . --force    # install the `tome` CLI from the working tree
 python3 tome.py --root ~/somewhere --port 7979   # run without installing
+make page                    # after editing web/app.css or web/app.js
+make binary                  # standalone executable for this platform
 ```
 
 **Never run `ruff format`.** The file is hand-formatted: the language tables,
@@ -79,6 +87,38 @@ in columns, and the formatter destroys that. CI lints only, deliberately.
   with a test in `TestSafePath`.
 - Errors that reach a user are plain sentences on stderr with a next action
   (`hint:` / `warning:`), never tracebacks.
+
+## The frontend lives in `web/`
+
+`PAGE` is ~890 lines, and 830 of them are CSS and JavaScript. Inside a Python
+string an editor cannot highlight them, a formatter cannot touch them, and no
+linter will ever look at them. So they are edited as real files and inlined:
+
+```bash
+$EDITOR web/app.css      # 383 lines, two-space indent re-applied on inline
+$EDITOR web/app.js       # 445 lines
+make page                # rewrites the PAGE constant in tome.py
+```
+
+**Commit `tome.py` along with whatever you changed in `web/`.** `tome.py` is
+still the whole program — the thing people curl, vendor, and freeze — so a
+change that only exists in `web/` has not shipped. The `page` job in `ci.yml`
+and a `--check` in `publish.yml` both fail on drift, the second so a stale UI
+can't reach PyPI and all five binaries.
+
+The catch worth knowing: editing the CSS or JS *inside* `tome.py` appears to
+work, and then the next `make page` silently reverts it. That is what the CI
+check is for.
+
+Two things stay inline in `PAGE` on purpose:
+
+- **The head bootstrap** (`<script>` in `<head>`) — it carries the
+  `{{SETTINGS}}` slot and sets the theme before first paint. A Python
+  placeholder inside a `.js` file would break the tooling this exists for.
+- **The HTML itself** — it is the template, slots and all.
+
+`tools/build_page.py` anchors on the single `<style>` and the *last* of exactly
+two `<script>` tags, and refuses to run if it finds a third rather than guessing.
 
 ## The website
 

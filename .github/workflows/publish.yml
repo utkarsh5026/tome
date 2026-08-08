@@ -38,6 +38,8 @@ jobs:
             echo "tag v$tag_version does not match __version__ = $file_version in tome.py" >&2
             exit 1
           fi
+      # A stale PAGE would ship a wrong UI to PyPI and into all five binaries.
+      - run: python3 tools/build_page.py --check
       - run: pip install build
       - run: python -m build
       - uses: actions/upload-artifact@v4
