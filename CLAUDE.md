@@ -35,9 +35,12 @@ change that. It serves file contents out of someone's working tree.
 |---|---|
 | **Configuration** | `Config`, `find_root`, `load_config`, `configure` — everything `.tome.json` can set |
 | **Discovery** | `build_tree` and friends: walking, grouping, labelling, kind detection |
+| **Git metadata** | `git_info`, `_last_change`, `doc_git` — one `git log` for the whole repo, cached |
 | **Syntax highlighting** | `LangSpec`, the keyword tables, `highlight` |
 | **Markdown → HTML** | the `Markdown` class — one instance per rendered doc |
-| **Documents** | `safe_path`, `_is_secret`, `render_doc`, `search` |
+| **Formats** | `Format`, `FORMATS`, `DOC_SUFFIXES`, front matter, the org translator, the notebook renderer |
+| **Documents** | `safe_path`, `_is_secret`, `render_doc`, `tree_payload`, `search`, `link_index`/`backlinks` |
+| **Export** | `export`, `_bundle` — every doc baked into one HTML file, no server behind it |
 | **Server** | `Handler`, CLI parsing, `main`, `cli` |
 | **The page** | `page_html`, `FAVICON`, and `PAGE` — the inline HTML. **The CSS and the app JS inside `PAGE` are generated; edit `web/app.css` and `web/app.js`.** |
 
@@ -79,6 +82,31 @@ in columns, and the formatter destroys that. CI lints only, deliberately.
   unknown: degrade to a paragraph, never mangle the page. `blocks()` must always
   make progress — `_paragraph` is the branch of last resort and always consumes
   at least one line.
+- **Adding a document format** means one `Format` entry in `FORMATS` and nothing
+  else — discovery, sidebar titles, link classing, search, the backlink index,
+  and `render_doc` all read from `DOC_SUFFIXES`. Never hard-code a suffix
+  outside that table; the `.markdown` files that were discovered but rendered as
+  source code for two releases are what that rule is for. A format's `title` and
+  `meta` callables run for every doc on every tree build, so they read a bounded
+  prefix or they cache (see `_ipynb_title`, which has to do the latter).
+  `links` is handed whatever `text` returns, which is why the notebook needs no
+  link reader of its own and org — whose `text` is org — does.
+- **Front matter is not YAML and must not grow into it.** `_front_matter`
+  reads `key: value`, `[a, b]`, and `- a` lists; everything else is skipped,
+  and a block that never closes is a horizontal rule, not metadata. Adding a
+  key means a reader (`meta_str`/`meta_list`/`meta_bool`/`meta_int`), a field on
+  `Doc` if the sidebar needs it, `tree_payload`, and the README.
+- **`tree_payload` and `page_html` are shared with the exporter.** A field the
+  server sends that the bundle doesn't (or the reverse) is a bug the tests catch
+  — the whole point is that the page cannot tell which one it is talking to. New
+  per-doc data goes in `render_doc`, which both go through.
+- **Anything cached about the repo gets cleared in `configure`.** `_GIT`,
+  `_INDEX`, and `_NB_TITLES` are caches about *this* root, and `configure` is
+  the only moment it can become a different one.
+- **A new format does not get its own parser.** Org is translated into markdown
+  and fed to `Markdown`; a notebook's cells are handed to it directly. That is
+  what keeps the rule above honest — a second parser is how the first one starts
+  growing toward CommonMark, and it would drift from it besides.
 - **The highlighter is a tokenizer, not a parser.** It will get edge cases wrong;
   that is accepted. Adding a language means adding a `LangSpec` and an alias, not
   special-casing `highlight`.

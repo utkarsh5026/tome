@@ -7,8 +7,12 @@ guard) is a function of a real directory layout.
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +37,34 @@ def make_repo(files: dict[str, str]) -> Path:
 
 def render(md: str, doc_rel: str = "README.md") -> str:
     return tome.Markdown(doc_rel).render(md)
+
+
+def render_org(src: str, doc_rel: str = "notes.org") -> str:
+    return tome._render_org(doc_rel, src)["html"]
+
+
+def notebook(cells: list[dict], language: str = "python") -> str:
+    """A minimal but real .ipynb, as JSON text."""
+    return json.dumps({
+        "cells": cells,
+        "metadata": {"kernelspec": {"name": f"{language}3", "language": language}},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    })
+
+
+def md_cell(source: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": source}
+
+
+def code_cell(source: str, outputs: list | None = None) -> dict:
+    return {
+        "cell_type": "code",
+        "metadata": {},
+        "source": source,
+        "outputs": outputs or [],
+        "execution_count": 1,
+    }
 
 
 class TestRootDiscovery(unittest.TestCase):
@@ -78,6 +110,11 @@ class TestConfig(unittest.TestCase):
         root = make_repo({"README.md": "# hi"})
         self.assertEqual(tome.ROOT, root.resolve())
         self.assertEqual(tome.ROOT, tome.ROOT.resolve())
+
+    def test_git_can_be_turned_off(self):
+        make_repo({"README.md": "# hi", ".tome.json": json.dumps({"git": False})})
+        self.assertFalse(tome.CFG.git)
+        self.assertEqual(tome.git_info(), {})
 
     def test_custom_editor_template_passes_through(self):
         cfg = tome.Config(root=Path("/tmp"), editor="mine://x?f={path}")
@@ -328,6 +365,244 @@ class TestServer(unittest.TestCase):
         self.assertIn("error", json.loads(self.get("/api/doc?p=.env")[1]))
 
 
+class TestFormats(unittest.TestCase):
+    """The registry, not any one format: what counts as a document."""
+
+    def test_every_registered_format_is_discovered(self):
+        make_repo({
+            "README.md": "# md",
+            "old.markdown": "# markdown",
+            "notes.org": "* org",
+            "nb.ipynb": notebook([md_cell("# nb")]),
+            "src/main.rs": "fn main() {}",
+        })
+        found = {d.rel for g in tome.build_tree() for d in g.docs}
+        self.assertEqual(found, {"README.md", "old.markdown", "notes.org", "nb.ipynb"})
+
+    def test_markdown_suffix_renders_as_a_doc_not_as_source(self):
+        make_repo({"old.markdown": "# Title\n\ntext\n"})
+        doc = tome.render_doc("old.markdown")
+        self.assertFalse(doc["source"])
+        self.assertIn("<h1", doc["html"])
+        self.assertEqual(doc["title"], "Title")
+
+    def test_links_between_formats_are_doc_links(self):
+        make_repo({"README.md": "x", "notes.org": "* x", "nb.ipynb": "{}", "s.rs": "x"})
+        html = render("[a](notes.org) [b](nb.ipynb) [c](s.rs)")
+        self.assertIn('class="l-doc" href="#/notes.org"', html)
+        self.assertIn('class="l-doc" href="#/nb.ipynb"', html)
+        self.assertIn('class="l-src" href="#/s.rs"', html)
+
+    def test_pinned_stem_is_found_in_any_format(self):
+        make_repo({"pkg/README.org": "* readme", "pkg/other.md": "# other"})
+        self.assertEqual(tome._primary_doc(tome.ROOT / "pkg"), "pkg/README.org")
+
+    def test_markdown_wins_when_a_stem_exists_twice(self):
+        make_repo({"pkg/README.org": "* org", "pkg/README.md": "# md"})
+        self.assertEqual(tome._primary_doc(tome.ROOT / "pkg"), "pkg/README.md")
+
+    def test_the_status_dot_only_reads_markdown(self):
+        # the convention is an HTML comment, and this runs on every tree build
+        make_repo({
+            "pkg/SPEC.ipynb": notebook([md_cell("<!-- status:\nstate: wrong\n-->")]),
+            "pkg/README.md": "# p\n<!-- status:\nstate: shipped\n-->\n",
+        })
+        groups = {g.gid: g for g in tome.build_tree()}
+        self.assertEqual(groups["pkg"].state, "shipped")
+
+    def test_checkpoints_are_skipped(self):
+        make_repo({
+            "nb.ipynb": notebook([md_cell("# real")]),
+            ".ipynb_checkpoints/nb-checkpoint.ipynb": notebook([md_cell("# ghost")]),
+        })
+        self.assertEqual([d.rel for g in tome.build_tree() for d in g.docs], ["nb.ipynb"])
+
+
+class TestOrg(unittest.TestCase):
+    def test_title_keyword_becomes_h1_and_shifts_headings(self):
+        out = tome._render_org("n.org", "#+TITLE: Notes\n\n* One\n** Two\n")
+        self.assertEqual(out["title"], "Notes")
+        self.assertIn("<h1 ", out["html"])
+        self.assertIn("<h2 ", out["html"])
+        self.assertIn("<h3 ", out["html"])
+        self.assertEqual([t["level"] for t in out["toc"]], [2, 3])
+
+    def test_without_a_title_the_first_section_is_the_h1(self):
+        out = tome._render_org("n.org", "* One\n\ntext\n** Two\n")
+        self.assertEqual(out["title"], "One")
+        self.assertIn("<h1 ", out["html"])
+        self.assertIn("<h2 ", out["html"])
+
+    def test_src_block_is_highlighted_like_a_fence(self):
+        html = render_org("#+begin_src rust\nfn main() {}\n#+end_src\n")
+        self.assertIn('class="lang-rust"', html)
+        self.assertIn("c-kw", html)
+
+    def test_inline_markup_becomes_markdown(self):
+        html = render_org("*bold* and /italic/ and =verbatim= and ~code~\n")
+        self.assertIn("<strong>bold</strong>", html)
+        self.assertIn("<em>italic</em>", html)
+        self.assertIn("<code>verbatim</code>", html)
+        self.assertIn("<code>code</code>", html)
+
+    def test_emphasis_does_not_reach_inside_verbatim(self):
+        self.assertIn("<code>a/b/c</code>", render_org("=a/b/c=\n"))
+
+    def test_links_resolve_like_markdown_links(self):
+        make_repo({"notes.org": "x", "src/main.rs": "fn main() {}"})
+        html = render_org("[[file:src/main.rs][main]] and [[https://x.dev][x]]\n")
+        self.assertIn('class="l-src" href="#/src/main.rs"', html)
+        self.assertIn('class="l-ext" href="https://x.dev"', html)
+
+    def test_heading_link_lands_on_the_headings_own_anchor(self):
+        html = render_org("* Rate Limits\n\nsee [[*Rate Limits]]\n")
+        self.assertIn('id="rate-limits"', html)
+        self.assertIn('href="#rate-limits">Rate Limits</a>', html)
+
+    def test_table_separator_is_translated(self):
+        html = render_org("| a | b |\n|---+---|\n| 1 | 2 |\n")
+        self.assertIn("<table>", html)
+        self.assertIn("<th", html)
+
+    def test_drawers_keywords_and_comments_are_dropped(self):
+        html = render_org(
+            "* One\n:PROPERTIES:\n:ID: abc\n:END:\n#+AUTHOR: nobody\n# a comment\nkept\n"
+        )
+        for gone in ("PROPERTIES", "abc", "nobody", "a comment"):
+            self.assertNotIn(gone, html)
+        self.assertIn("kept", html)
+
+    def test_quote_block_becomes_a_blockquote(self):
+        html = render_org("#+begin_quote\nbackpressure is a feature\n#+end_quote\n")
+        self.assertIn("<blockquote", html)
+        self.assertIn("backpressure is a feature", html)
+
+    def test_tags_are_stripped_from_headings(self):
+        out = tome._render_org("n.org", "* Design                    :work:urgent:\n")
+        self.assertEqual(out["title"], "Design")
+        self.assertNotIn("urgent", out["html"])
+
+    def test_checkboxes_map_onto_tomes_three_states(self):
+        html = render_org("- [X] done\n- [-] partly\n- [ ] not yet\n")
+        self.assertIn('class="task done"', html)
+        self.assertIn('class="task open-field"', html)
+        self.assertIn('class="task open"', html)
+
+    def test_description_list_keeps_both_halves(self):
+        html = render_org("- capacity :: how many tokens fit\n")
+        self.assertIn("<strong>capacity</strong>", html)
+        self.assertIn("how many tokens fit", html)
+
+    def test_sidebar_title_prefers_the_title_keyword(self):
+        root = make_repo({"a.org": "* First\n#+TITLE: Real\n", "b.org": "* Only\n"})
+        self.assertEqual(tome._first_heading(root / "a.org"), "Real")
+        self.assertEqual(tome._first_heading(root / "b.org"), "Only")
+
+    def test_renders_end_to_end_as_a_document(self):
+        make_repo({"docs/notes.org": "#+TITLE: Notes\n\n* One\ntext\n"})
+        doc = tome.render_doc("docs/notes.org")
+        self.assertFalse(doc["source"])
+        self.assertEqual(doc["title"], "Notes")
+        self.assertEqual(doc["kind"], "doc")
+
+
+class TestNotebook(unittest.TestCase):
+    def test_markdown_and_code_cells_both_render(self):
+        out = tome._render_notebook("n.ipynb", notebook([
+            md_cell("# Bucket\n\nHow it *refills*.\n"),
+            code_cell("def take(n):\n    return n\n"),
+        ]))
+        self.assertEqual(out["title"], "Bucket")
+        self.assertIn("<em>refills</em>", out["html"])
+        self.assertIn('class="lang-python"', out["html"])
+        self.assertIn("c-kw", out["html"])
+
+    def test_the_toc_accumulates_across_cells(self):
+        out = tome._render_notebook("n.ipynb", notebook([
+            md_cell("# Top\n"), code_cell("x = 1"), md_cell("## One\n"), md_cell("## Two\n"),
+        ]))
+        self.assertEqual([t["text"] for t in out["toc"]], ["One", "Two"])
+
+    def test_stream_output_renders_below_its_cell(self):
+        html = tome._render_notebook("n.ipynb", notebook([
+            code_cell("print(1)", [{"output_type": "stream", "name": "stdout", "text": ["1\n"]}]),
+        ]))["html"]
+        self.assertIn('class="cb out"', html)
+        self.assertIn(">1<", html)
+
+    def test_png_output_becomes_a_data_uri(self):
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
+        html = tome._render_notebook("n.ipynb", notebook([
+            code_cell("plot()", [{"output_type": "display_data",
+                                  "data": {"image/png": png, "text/plain": "<Figure>"}}]),
+        ]))["html"]
+        self.assertIn(f'src="data:image/png;base64,{png}"', html)
+        self.assertNotIn("Figure", html)  # the plot supersedes its repr
+
+    def test_a_non_base64_image_payload_never_reaches_the_data_uri(self):
+        html = tome._render_notebook("n.ipynb", notebook([
+            code_cell("plot()", [{"output_type": "display_data",
+                                  "data": {"image/png": '"><script>x</script>'}}]),
+        ]))["html"]
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("data:image/png", html)
+
+    def test_tracebacks_lose_their_ansi_colours(self):
+        html = tome._render_notebook("n.ipynb", notebook([
+            code_cell("boom()", [{
+                "output_type": "error", "ename": "ValueError", "evalue": "nope",
+                "traceback": ["\x1b[0;31mValueError\x1b[0m: nope", "  at line 1"],
+            }]),
+        ]))["html"]
+        self.assertIn('class="cb out err"', html)
+        self.assertIn("ValueError: nope", html)
+        self.assertNotIn("\x1b", html)
+        self.assertNotIn("0;31m", html)
+
+    def test_long_output_is_truncated(self):
+        html = tome._render_notebook("n.ipynb", notebook([
+            code_cell("spam()", [{"output_type": "stream", "name": "stdout",
+                                  "text": ["x" * (tome.NB_OUTPUT_LIMIT + 500)]}]),
+        ]))["html"]
+        self.assertIn("truncated", html)
+        self.assertLess(len(html), tome.NB_OUTPUT_LIMIT + 400)
+
+    def test_language_comes_from_the_kernel(self):
+        out = tome._render_notebook("n.ipynb", notebook([code_cell("let x = 1;")], "rust"))
+        self.assertIn('class="lang-rust"', out["html"])
+
+    def test_a_broken_notebook_degrades_instead_of_raising(self):
+        out = tome._render_notebook("n.ipynb", "{not json at all")
+        self.assertIn("not valid JSON", out["html"])
+        self.assertEqual(out["toc"], [])
+
+    def test_search_reads_the_cells_not_the_json(self):
+        png = base64.b64encode(b"\x89PNG" * 40).decode()
+        make_repo({"nb.ipynb": notebook([
+            md_cell("# Bucket\n\nbackpressure matters\n"),
+            code_cell("take()", [{"output_type": "display_data", "data": {"image/png": png}}]),
+        ])})
+        self.assertEqual(tome.search("backpressure")[0]["path"], "nb.ipynb")
+        self.assertEqual(tome.search("cell_type"), [])
+        self.assertEqual(tome.search("nbformat"), [])
+
+    def test_the_cached_title_is_invalidated_by_a_rewrite(self):
+        root = make_repo({"nb.ipynb": notebook([md_cell("# First\n")])})
+        path = root / "nb.ipynb"
+        self.assertEqual(tome._first_heading(path), "First")
+        path.write_text(notebook([md_cell("# Second\n")]), encoding="utf-8")
+        self.assertEqual(tome._first_heading(path), "Second")
+
+    def test_an_oversized_notebook_is_refused_rather_than_parsed(self):
+        make_repo({"big.ipynb": notebook([md_cell("# big\n")])})
+        original = tome.DOC_SUFFIXES[".ipynb"].max_bytes
+        tome.DOC_SUFFIXES[".ipynb"].max_bytes = 10
+        try:
+            self.assertIn("too large", tome.render_doc("big.ipynb")["error"])
+        finally:
+            tome.DOC_SUFFIXES[".ipynb"].max_bytes = original
+
+
 class TestSay(unittest.TestCase):
     """Windows hands back a legacy code page on a redirected stdout, and the
     banner is full of emoji. Printing it must never be what kills the process."""
@@ -365,6 +640,256 @@ class TestSay(unittest.TestCase):
 
     def test_err_routes_to_stderr(self):
         self.assertIn("warning: x", self.capture("warning: x — y", "ascii", err=True))
+
+
+class TestFrontMatter(unittest.TestCase):
+    """A `---` block at the top of a markdown doc. Not YAML, on purpose."""
+
+    def test_block_is_stripped_and_names_the_doc(self):
+        make_repo({"a.md": "---\ntitle: Real Title\n---\n\n# Ignored\n\nbody\n"})
+        doc = tome.render_doc("a.md")
+        self.assertEqual(doc["title"], "Real Title")
+        self.assertNotIn("Real Title", doc["html"])
+        self.assertNotIn("<hr", doc["html"])
+        self.assertIn("body", doc["html"])
+
+    def test_the_sidebar_title_agrees_with_the_rendered_one(self):
+        make_repo({"a.md": "---\ntitle: From Front Matter\n---\n\n# Heading\n"})
+        docs = [d for g in tome.build_tree() for d in g.docs]
+        self.assertEqual(docs[0].title, "From Front Matter")
+
+    def test_tags_in_all_three_spellings(self):
+        make_repo({
+            "a.md": "---\ntags: [api, http]\n---\n# a\n",
+            "b.md": "---\ntags:\n  - api\n  - grpc\n---\n# b\n",
+            "c.md": "---\ntags: api, http\n---\n# c\n",
+        })
+        tags = {d.rel: d.tags for g in tome.build_tree() for d in g.docs}
+        self.assertEqual(tags["a.md"], ["api", "http"])
+        self.assertEqual(tags["b.md"], ["api", "grpc"])
+        self.assertEqual(tags["c.md"], ["api", "http"])
+
+    def test_order_outranks_the_pinned_convention(self):
+        make_repo({"README.md": "# r\n", "z.md": "---\norder: 1\n---\n# z\n"})
+        groups = tome.build_tree()
+        self.assertEqual([d.rel for d in groups[0].docs], ["z.md", "README.md"])
+
+    def test_draft_reaches_the_reader(self):
+        make_repo({"a.md": "---\ndraft: yes\n---\n# a\n"})
+        self.assertTrue(tome.render_doc("a.md")["draft"])
+
+    def test_an_unclosed_block_is_a_horizontal_rule(self):
+        """Swallowing a whole document is much worse than missing metadata."""
+        make_repo({"a.md": "---\n\nnot metadata, just a rule and then prose\n"})
+        doc = tome.render_doc("a.md")
+        self.assertIn("just a rule", doc["html"])
+        self.assertEqual(doc["tags"], [])
+
+    def test_a_hash_in_a_value_is_not_a_comment(self):
+        make_repo({"a.md": "---\ntitle: C# notes\n---\n# a\n"})
+        self.assertEqual(tome.render_doc("a.md")["title"], "C# notes")
+
+    def test_quotes_and_whole_line_comments(self):
+        make_repo({"a.md": '---\n# a comment\ntitle: "Quoted"\n---\n# a\n'})
+        self.assertEqual(tome.render_doc("a.md")["title"], "Quoted")
+
+    def test_a_doc_without_any_is_left_alone(self):
+        make_repo({"a.md": "# Plain\n\nbody\n"})
+        doc = tome.render_doc("a.md")
+        self.assertEqual(doc["title"], "Plain")
+        self.assertEqual(doc["tags"], [])
+        self.assertFalse(doc["draft"])
+
+
+class TestBacklinks(unittest.TestCase):
+    def paths(self, rel: str) -> list[str]:
+        return [b["path"] for b in tome.backlinks(rel)]
+
+    def test_a_link_shows_up_at_the_far_end(self):
+        make_repo({"README.md": "# Home\n\n[spec](docs/SPEC.md)\n", "docs/SPEC.md": "# Spec\n"})
+        self.assertEqual(self.paths("docs/SPEC.md"), ["README.md"])
+        self.assertEqual(self.paths("README.md"), [])
+
+    def test_relative_hops_and_anchors_resolve(self):
+        make_repo({"docs/a.md": "# a\n\n[b](../notes/b.md#part)\n", "notes/b.md": "# b\n"})
+        self.assertEqual(self.paths("notes/b.md"), ["docs/a.md"])
+
+    def test_source_files_get_them_too(self):
+        make_repo({"SPEC.md": "# Spec\n\n[r](src/router.rs)\n", "src/router.rs": "fn r() {}\n"})
+        self.assertEqual(tome.render_doc("src/router.rs")["backlinks"][0]["title"], "Spec")
+
+    def test_org_links_land_in_the_same_graph(self):
+        make_repo({"notes.org": "* Notes\n[[file:README.md][home]]\n", "README.md": "# Home\n"})
+        self.assertEqual(self.paths("README.md"), ["notes.org"])
+
+    def test_notebook_links_land_in_the_same_graph(self):
+        make_repo({
+            "nb.ipynb": notebook([md_cell("# nb\n\n[home](README.md)")]),
+            "README.md": "# Home\n",
+        })
+        self.assertEqual(self.paths("README.md"), ["nb.ipynb"])
+
+    def test_external_and_anchor_links_are_not_targets(self):
+        make_repo({"a.md": "# a\n\n[x](https://example.com) [y](#top)\n"})
+        self.assertEqual(tome.link_index().out["a.md"], [])
+
+    def test_a_doc_is_never_its_own_backlink(self):
+        make_repo({"a.md": "# a\n\n[self](a.md)\n"})
+        self.assertEqual(tome.backlinks("a.md"), [])
+
+    def test_images_do_not_make_backlinks(self):
+        make_repo({"a.md": "# a\n\n![logo](logo.png)\n", "logo.png": "x"})
+        self.assertEqual(tome.backlinks("logo.png"), [])
+
+    def test_the_same_link_twice_counts_once(self):
+        make_repo({"a.md": "# a\n\n[b](b.md) and [b again](b.md)\n", "b.md": "# b\n"})
+        self.assertEqual(self.paths("b.md"), ["a.md"])
+
+    def test_the_index_follows_an_edit(self):
+        root = make_repo({"a.md": "# a\n", "b.md": "# b\n"})
+        self.assertEqual(tome.backlinks("b.md"), [])
+        (root / "a.md").write_text("# a\n\n[b](b.md)\n", encoding="utf-8")
+        # the mtime fingerprint rounds to the second — make the edit unambiguous
+        later = (root / "a.md").stat().st_mtime + 5
+        os.utime(root / "a.md", (later, later))
+        self.assertEqual(self.paths("b.md"), ["a.md"])
+
+
+def have_git() -> bool:
+    try:
+        return subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+class TestGitMetadata(unittest.TestCase):
+    def commit_repo(self, files: dict[str, str]):
+        root = make_repo(files)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Ada", "GIT_AUTHOR_EMAIL": "ada@example.com",
+            "GIT_COMMITTER_NAME": "Ada", "GIT_COMMITTER_EMAIL": "ada@example.com",
+        }
+        for args in (("init", "-q"), ("add", "-A"), ("commit", "-qm", "first")):
+            subprocess.run(
+                ["git", "-C", str(root), *args], capture_output=True, env=env, check=True
+            )
+        tome.configure(tome.load_config(root))  # a new repo, so a cold cache
+        return root
+
+    @unittest.skipUnless(have_git(), "git is not installed")
+    def test_the_last_commit_is_what_the_reader_shows(self):
+        self.commit_repo({"README.md": "# hi\n"})
+        self.assertEqual(tome.git_info()["README.md"]["by"], "Ada")
+        doc = tome.render_doc("README.md")
+        self.assertEqual(doc["git"]["by"], "Ada")
+        self.assertTrue(doc["git"]["id"])
+        self.assertGreater(doc["git"]["at"], 0)
+
+    @unittest.skipUnless(have_git(), "git is not installed")
+    def test_an_uncommitted_doc_falls_back_to_its_mtime(self):
+        root = self.commit_repo({"README.md": "# hi\n"})
+        (root / "new.md").write_text("# new\n", encoding="utf-8")
+        doc = tome.render_doc("new.md")
+        self.assertEqual(doc["git"]["by"], "")
+        self.assertAlmostEqual(doc["git"]["at"], (root / "new.md").stat().st_mtime, places=3)
+
+    @unittest.skipUnless(have_git(), "git is not installed")
+    def test_the_config_can_turn_it_off(self):
+        root = self.commit_repo({"README.md": "# hi\n"})
+        (root / ".tome.json").write_text(json.dumps({"git": False}), encoding="utf-8")
+        tome.configure(tome.load_config(root))
+        self.assertEqual(tome.git_info(), {})
+        self.assertEqual(tome.render_doc("README.md")["git"]["by"], "")
+
+    def test_a_directory_that_is_not_a_repo_still_reports_a_time(self):
+        make_repo({"README.md": "# hi\n"})
+        doc = tome.render_doc("README.md")
+        self.assertEqual(doc["git"]["by"], "")
+        self.assertGreater(doc["git"]["at"], 0)
+
+
+class TestExport(unittest.TestCase):
+    """One HTML file with everything in it — same page, no server behind it."""
+
+    def settings(self, page: str) -> dict:
+        at = page.index("const TOME = ") + len("const TOME = ")
+        return json.loads(page[at : page.index(";\n", at)])
+
+    def bundle(self, page: str) -> dict:
+        return self.settings(page)["bundle"]
+
+    def export(self, root: Path) -> str:
+        """Export `root`, without its summary landing in the test output."""
+        dest = root / "out.html"
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = tome.export(dest)
+        self.assertEqual(code, 0, err.getvalue())
+        return dest.read_text(encoding="utf-8")
+
+    def write(self, files: dict[str, str]) -> tuple[Path, str]:
+        root = make_repo(files)
+        return root, self.export(root)
+
+    def test_every_doc_is_baked_in(self):
+        _, page = self.write({"README.md": "# Home\n\n[s](docs/S.md)\n", "docs/S.md": "# Spec\n"})
+        docs = self.bundle(page)["docs"]
+        self.assertIn("<h1", docs["README.md"]["html"])
+        self.assertIn("docs/S.md", docs)
+        self.assertNotIn("{{SETTINGS}}", page)
+
+    def test_the_groups_match_what_the_server_would_send(self):
+        root = make_repo({"README.md": "# Home\n", "docs/a.md": "# a\n"})
+        baked = self.bundle(self.export(root))["groups"]
+        served = tome.tree_payload()["groups"]
+        self.assertEqual([g["id"] for g in baked], [g["id"] for g in served])
+
+    def test_docs_carry_the_text_their_search_needs(self):
+        _, page = self.write({"a.md": "# a\n\nthe needle is here\n"})
+        self.assertIn("needle", self.bundle(page)["docs"]["a.md"]["text"])
+
+    def test_linked_source_files_come_along(self):
+        _, page = self.write({
+            "SPEC.md": "# Spec\n\n[router](src/router.rs)\n",
+            "src/router.rs": "fn route() {}\n",
+        })
+        docs = self.bundle(page)["docs"]
+        self.assertTrue(docs["src/router.rs"]["source"])
+        self.assertNotIn("text", docs["src/router.rs"])  # source files are not searched
+
+    def test_an_unlinked_source_file_stays_out(self):
+        _, page = self.write({"README.md": "# Home\n", "src/lonely.rs": "fn x() {}\n"})
+        self.assertNotIn("src/lonely.rs", self.bundle(page)["docs"])
+
+    def test_images_become_data_uris(self):
+        root = make_repo({"README.md": "# Home\n\n![logo](logo.png)\n"})
+        (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        html = self.bundle(self.export(root))["docs"]["README.md"]["html"]
+        self.assertIn("data:image/png;base64,", html)
+        self.assertNotIn("/raw?p=", html)
+
+    def test_a_missing_image_keeps_its_path_instead_of_breaking_the_export(self):
+        _, page = self.write({"README.md": "# Home\n\n![gone](nope.png)\n"})
+        self.assertIn('src="nope.png"', self.bundle(page)["docs"]["README.md"]["html"])
+
+    def test_a_linked_secret_is_still_a_secret(self):
+        _, page = self.write({"README.md": "# Home\n\n[env](.env)\n", ".env": "SECRET=1"})
+        self.assertNotIn("SECRET=1", page)
+
+    def test_nothing_in_a_doc_can_close_the_script_tag(self):
+        _, page = self.write({"a.md": "# a\n\n`</script><b>pwn</b>`\n"})
+        self.assertNotIn("</script><b>pwn", page)
+        self.assertIn("\\u003c/script", page)
+
+    def test_it_carries_no_trace_of_the_machine_that_made_it(self):
+        root, page = self.write({"README.md": "# Home\n"})
+        self.assertNotIn(str(root), page)
+        self.assertNotIn("abs", self.bundle(page)["docs"]["README.md"])
+
+    def test_the_export_has_no_editor_to_open(self):
+        _, page = self.write({"README.md": "# Home\n"})
+        self.assertEqual(self.settings(page)["editorUrl"], "")
 
 
 if __name__ == "__main__":

@@ -105,9 +105,26 @@ function toggleZen(){
   applyChrome();
 }
 
-/* ── data ───────────────────────────────────────────────────────────────── */
+/* ── data ─────────────────────────────────────────────────────────────────
+   A served page asks the server for its payloads; an export carries the very
+   same ones inside TOME.bundle. These three are the only place that knows
+   which it is — everything below reads one shape either way.              */
+const BUNDLE = TOME.bundle || null;
+
+const getTree = () => BUNDLE
+  ? Promise.resolve({groups: BUNDLE.groups, version: BUNDLE.version})
+  : fetch("/api/tree").then(r => r.json());
+
+const getDoc = (path) => BUNDLE
+  ? Promise.resolve(BUNDLE.docs[path] || {error: "not included in this export: " + path})
+  : fetch("/api/doc?p=" + encodeURIComponent(path)).then(r => r.json());
+
+const getSearch = (q) => BUNDLE
+  ? Promise.resolve({results: localSearch(q)})
+  : fetch("/api/search?q=" + encodeURIComponent(q)).then(r => r.json());
+
 async function loadTree(){
-  const r = await fetch("/api/tree").then(r => r.json());
+  const r = await getTree();
   TREE = r.groups; VERSION = r.version;
   FLAT = [];
   for (const g of TREE) for (const d of g.docs) FLAT.push({...d, group: g.title, gid: g.id});
@@ -121,9 +138,7 @@ function renderNav(){
   nav.innerHTML = "";
   const saved = JSON.parse(localStorage.getItem(RK("open")) || "{}");
   for (const g of TREE){
-    const docs = filter
-      ? g.docs.filter(d => (d.title + " " + d.path + " " + d.label).toLowerCase().includes(filter))
-      : g.docs;
+    const docs = filter ? g.docs.filter(d => matches(d, filter)) : g.docs;
     if (!docs.length) continue;
     const isOpen = filter ? true : (saved[g.id] ?? defaultOpen(g));
     const div = document.createElement("div");
@@ -135,7 +150,8 @@ function renderNav(){
       (g.state ? `<span class="st ${esc(g.state)}" title="${esc(g.state)}"></span>` : "") +
       `</div><div class="gitems">` +
       docs.map(d =>
-        `<a class="item k${d.kind}${d.path === CUR ? " on" : ""}" href="#/${d.path}">` +
+        `<a class="item k${d.kind}${d.path === CUR ? " on" : ""}${d.draft ? " isdraft" : ""}" ` +
+        `href="#/${d.path}">` +
         `<span class="k">${d.kind === "doc" ? "·" : d.kind[0]}</span>` +
         `<span>${esc(d.label)}</span></a>`).join("") +
       `</div>`;
@@ -156,6 +172,11 @@ const defaultOpen = (g) =>
   Boolean(g.prefix && CUR && CUR.startsWith(g.prefix)) || g.id === "root";
 const ESCAPES = {"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;"};
 const esc = (s) => (s || "").replace(/[&<>"]/g, (c) => ESCAPES[c]);
+/* Names match loosely, tags exactly: clicking the tag "api" should not also
+   pull in every doc whose path happens to contain those three letters. */
+const matches = (d, q) =>
+  (d.title + " " + d.path + " " + d.label).toLowerCase().includes(q) ||
+  (d.tags || []).some(t => t.toLowerCase() === q);
 
 /* ── routing ────────────────────────────────────────────────────────────── */
 function route(){
@@ -171,7 +192,7 @@ function route(){
 
 async function openDoc(path, anchor, keepScroll){
   const scroll = keepScroll ? window.scrollY : 0;
-  const d = await fetch("/api/doc?p=" + encodeURIComponent(path)).then(r => r.json());
+  const d = await getDoc(path);
   if (d.error){
     $("#doc").innerHTML = `<div class="empty">${esc(d.error)}</div>`;
     $("#crumb").textContent = path;
@@ -180,16 +201,17 @@ async function openDoc(path, anchor, keepScroll){
   }
   CUR = d.path;
   localStorage.setItem(RK("last"), d.path);
-  document.title = d.title + " · gauntlet docs";
+  document.title = d.title + " · " + TOME.name;
   const parts = d.path.split("/");
   $("#crumb").innerHTML = parts.map((p, i) =>
     i === parts.length - 1 ? `<b>${esc(p)}</b>` : esc(p)).join(" / ");
   const ed = $("#editBtn");
   ed.href = TOME.editorUrl ? TOME.editorUrl.replace("{path}", d.abs) : "#";
   ed.style.display = TOME.editorUrl ? "" : "none";
-  $("#doc").innerHTML = d.html + prevNext(d.path);
+  $("#doc").innerHTML = docMeta(d) + d.html + backlinks(d) + prevNext(d.path);
   buildToc(d.toc);
   wireCode();
+  wireMeta();
   if (d.mermaid) loadMermaid();
   renderNav();
   document.querySelector(".item.on")?.scrollIntoView({block:"nearest"});
@@ -219,6 +241,51 @@ function scrollToText(q){
     setTimeout(() => mark.classList.remove("flash"), 2200);
     return;
   }
+}
+
+/* ── document furniture ───────────────────────────────────────────────────
+   What a doc knows about itself beyond its prose: when it last changed, who
+   changed it, what it declared in its front matter, and who links to it. */
+const SPANS = [[31536000,"y"], [2592000,"mo"], [604800,"w"], [86400,"d"], [3600,"h"], [60,"m"]];
+function ago(ts){
+  if (!ts) return "";
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return "just now";
+  for (const [span, unit] of SPANS) if (s >= span) return Math.floor(s / span) + unit + " ago";
+  return "";
+}
+
+function docMeta(d){
+  const git = d.git || {};
+  const bits = [];
+  const when = ago(git.at);
+  if (when){
+    const exact = new Date(git.at * 1000).toLocaleString();
+    bits.push(`<span class="mi" title="${esc(exact)}">${esc(when)}</span>`);
+  }
+  if (git.by) bits.push(`<span class="mi">${esc(git.by)}</span>`);
+  if (git.id) bits.push(`<span class="mi mono">${esc(git.id)}</span>`);
+  if (d.draft) bits.push('<span class="chip draft">draft</span>');
+  for (const t of d.tags || [])
+    bits.push(`<button class="chip tag" data-tag="${esc(t)}">${esc(t)}</button>`);
+  return bits.length ? `<div class="dmeta">${bits.join("")}</div>` : "";
+}
+
+/* A tag is a filter you can see: clicking one narrows the sidebar to it. */
+function wireMeta(){
+  document.querySelectorAll(".chip.tag").forEach(b => b.onclick = () => {
+    $("#filter").value = b.dataset.tag;
+    if (HIDE_NAV) toggleNav();
+    renderNav();
+  });
+}
+
+function backlinks(d){
+  const bl = d.backlinks || [];
+  if (!bl.length) return "";
+  return '<div class="bl"><div class="blh">linked from</div>' + bl.map(b =>
+    `<a href="#/${esc(b.path)}">${esc(b.title || b.path)}` +
+    `<span class="p">${esc(b.path)}</span></a>`).join("") + "</div>";
 }
 
 function prevNext(path){
@@ -299,7 +366,45 @@ function loadMermaid(){
   document.head.appendChild(s);
 }
 
-/* ── command palette ────────────────────────────────────────────────────── */
+/* ── command palette ──────────────────────────────────────────────────────
+   Fuzzy matching over titles and paths happens here in both modes; the
+   full-text sweep is the server's job, unless there is no server.        */
+
+/* The server's `search()`, in the browser: the same brute-force pass over the
+   same text the server would have read, so an export's ⌘K finds what the
+   served page finds — including the line numbers it reports.            */
+function localSearch(q){
+  const needle = q.trim().toLowerCase();
+  if (needle.length < 2) return [];
+  const out = [];
+  for (const g of BUNDLE.groups){
+    for (const entry of g.docs){
+      const doc = BUNDLE.docs[entry.path];
+      if (!doc || !doc.text || !doc.text.toLowerCase().includes(needle)) continue;
+      const lines = doc.text.split("\n");
+      const mine = [];
+      let hits = 0;
+      for (let i = 0; i < lines.length; i++){
+        if (!lines[i].toLowerCase().includes(needle)) continue;
+        hits++;
+        if (hits > 3) continue;
+        let sn = lines[i].trim();
+        if (sn.length > 190){
+          const at = sn.toLowerCase().indexOf(needle);
+          sn = "…" + sn.slice(Math.max(0, at - 70), at + 120) + "…";
+        }
+        mine.push({path: entry.path, title: entry.title, group: g.title,
+                   line: i + 1, snippet: sn, count: 0});
+      }
+      for (const r of mine) r.count = hits;
+      out.push(...mine);
+    }
+  }
+  out.sort((a, b) =>
+    b.count - a.count || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0) || a.line - b.line);
+  return out.slice(0, 60);
+}
+
 function fuzzy(q, s){
   q = q.toLowerCase(); s = s.toLowerCase();
   let qi = 0, score = 0, streak = 0;
@@ -333,7 +438,7 @@ function paletteRender(q){
   if (q.length >= 3){
     clearTimeout(searchT);
     searchT = setTimeout(async () => {
-      const r = await fetch("/api/search?q=" + encodeURIComponent(q)).then(r => r.json());
+      const r = await getSearch(q);
       if ($("#q").value.trim() !== q) return;
       const hits = r.results.map(x => ({...x, _hit: true}));
       RESULTS = RESULTS.concat(hits);
@@ -429,8 +534,9 @@ document.addEventListener("keydown", (e) => {
 
 window.addEventListener("hashchange", route);
 
-/* live reload — repoll mtimes; re-render the open doc in place when it changes */
-setInterval(async () => {
+/* live reload — repoll mtimes; re-render the open doc in place when it changes.
+   An export has no server to poll and nothing behind it that can change. */
+if (!BUNDLE) setInterval(async () => {
   try{
     const r = await fetch("/api/version").then(r => r.json());
     if (r.version !== VERSION){
