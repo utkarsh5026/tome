@@ -54,6 +54,18 @@ jobs:
           curl -sf http://127.0.0.1:7979/ | grep -q "<title>"
           curl -sf http://127.0.0.1:7979/api/tree | grep -q '"groups"'
 
+  # tome.py's PAGE constant is generated from web/. Editing the copy inside
+  # tome.py works right up until the next `make page` silently reverts it, so
+  # catch the drift here instead.
+  page:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python3 tools/build_page.py --check
+
   # The site is README.md rendered by tome itself, so a broken renderer breaks
   # the build here rather than shipping a broken page.
   site:
@@ -72,7 +84,7 @@ jobs:
 
   # Publish only from main, and only once everything above is green.
   deploy:
-    needs: [test, lint, install, site]
+    needs: [test, lint, install, page, site]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
