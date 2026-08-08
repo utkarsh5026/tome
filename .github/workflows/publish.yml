@@ -74,10 +74,14 @@ jobs:
           # reaches a lot of machines that 2.39 does not.
           # --strip is Linux-only — on macOS it can invalidate the ad-hoc
           # signature, and it buys about 2.5MB where it does apply.
+          # macOS needs explicit labels: bare `macos-15` is arm64, and the Intel
+          # image is a separate `-intel` label. Don't reach for macos-13 (retired,
+          # so a job targeting it queues forever instead of failing) or macos-14
+          # (deprecated).
           - { os: ubuntu-22.04,     asset: tome-linux-x86_64,       strip: "--strip" }
           - { os: ubuntu-22.04-arm, asset: tome-linux-aarch64,      strip: "--strip" }
-          - { os: macos-13,         asset: tome-macos-x86_64,       strip: ""        }  # Intel
-          - { os: macos-14,         asset: tome-macos-arm64,        strip: ""        }  # Apple Silicon
+          - { os: macos-15-intel,   asset: tome-macos-x86_64,       strip: ""        }
+          - { os: macos-15,         asset: tome-macos-arm64,        strip: ""        }
           - { os: windows-latest,   asset: tome-windows-x86_64.exe, strip: ""        }
     runs-on: ${{ matrix.os }}
     defaults:
